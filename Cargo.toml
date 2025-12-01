@@ -1,0 +1,88 @@
+[package]
+name = "cex-backend"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+bench_mode = []
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat", "io"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP Client (axios 같은 역할)
+reqwest = { version = "0.11", features = ["json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# OpenAPI/Swagger documentation
+utoipa = { version = "4.0", features = ["axum_extras", "chrono"] }
+utoipa-swagger-ui = { version = "6.0", features = ["axum"] }
+
+# Solana client (RPC 통신용)
+solana-client = "1.18"
+solana-sdk = "1.18"
+anchor-client = "0.30"
+anchor-lang = "0.30"
+
+# Database (PostgreSQL)
+sqlx = { version = "0.6", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "chrono", "uuid", "macros", "migrate", "decimal"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["serde", "v4"] }
+rust_decimal = { version = "1.33", features = ["serde-with-str"] }  # For precise decimal calculations (orders, balances)
+
+# Password hashing
+argon2 = "0.5"
+
+# Base64 encoding (for private key storage)
+base64 = "0.21"
+
+# JWT (JSON Web Tokens)
+jsonwebtoken = "9.2"
+
+# Crypto (for token hashing)
+sha2 = "0.10"
+rand = "0.8"
+
+# High-performance channels (Lock-free Ring Buffer)
+crossbeam = "0.8"
+
+# Async trait (for Engine trait)
+async-trait = "0.1"
+
+# Thread-safe primitives (RwLock, Mutex)
+parking_lot = "0.12"
+
+# CPU 코어 고정
+core_affinity = "0.8"
+
+# 실시간 스케줄링 (Linux only)
+nix = { version = "0.27", features = ["sched"] }
+
+# 벤치마크 (TPS 측정)
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# WebSocket (바이낸스 클라이언트 및 프론트엔드 서버)
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+url = "2.5"
+hyper = { version = "1.0", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[dev-dependencies]
+# 테스트용
+
+[[bench]]
+name = "tps_benchmark"
+harness = false
+required-features = ["bench_mode"]
+

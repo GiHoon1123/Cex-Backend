@@ -1,0 +1,1732 @@
+// =====================================================
+// Threads - 스레드 루프 함수들
+// =====================================================
+// 역할: 엔진 스레드와 WAL 스레드의 메인 루프 구현
+//
+// 구조:
+// - engine_thread_loop(): 주문 처리 루프 (Core 0)
+// - wal_thread_loop(): WAL 쓰기 루프 (Core 1)
+// =====================================================
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use anyhow::{Result, Context};
+use crossbeam::channel::Receiver;
+use parking_lot::{RwLock, Mutex};
+use rust_decimal::Decimal;
+use sqlx::PgPool;
+use crate::shared::database::Database;
+
+use crate::domains::cex::engine::types::{TradingPair, OrderEntry, MatchResult};
+use crate::domains::cex::engine::orderbook::OrderBook;
+use crate::domains::cex::engine::matcher::Matcher;
+use crate::domains::cex::engine::executor::Executor;
+use crate::domains::cex::engine::wal::{WalEntry, WalWriter};
+
+use super::commands::OrderCommand;
+use super::balance_commands::BalanceCommand;
+use super::config::CoreConfig;
+
+// =====================================================
+// 엔진 스레드 루프
+// =====================================================
+// 역할: 모든 주문을 순차적으로 처리하는 싱글 스레드 루프
+//
+// 처리 과정:
+// 1. 코어 고정 (Core 0)
+// 2. 실시간 스케줄링 (SCHED_FIFO, 우선순위 99)
+// 3. 주문 명령 수신 루프
+// 4. 각 명령 처리 (SubmitOrder, CancelOrder 등)
+// 5. 결과를 oneshot 채널로 반환
+// =====================================================
+
+/// 엔진 스레드 메인 루프
+/// 
+/// # Arguments
+/// * `order_rx` - 주문 명령 수신 채널
+/// * `balance_rx` - 잔고 업데이트 명령 수신 채널 (우선순위 높음)
+/// * `wal_tx` - WAL 메시지 전송 채널
+/// * `db_tx` - DB 명령 전송 채널
+/// * `orderbooks` - 거래쌍별 오더북 (공유)
+/// * `matcher` - 매칭 엔진 (공유)
+/// * `executor` - 체결 실행 엔진 (공유)
+/// * `running` - 실행 중 여부 플래그
+/// 
+/// # 처리 흐름 (우선순위 기반)
+/// ```
+/// loop {
+///     // 1. 잔고 업데이트 큐 우선 확인 (논블로킹)
+///     match balance_rx.try_recv() {
+///         Ok(cmd) => {
+///             handle_update_balance(cmd);
+///             continue;  // 다음 루프로
+///         }
+///         Err(TryRecvError::Empty) => {
+///             // 큐가 비어있음, 주문 큐 확인
+///         }
+///         Err(TryRecvError::Disconnected) => break,
+///     }
+///     
+///     // 2. 주문 큐 확인 (블로킹)
+///     match order_rx.recv() {
+///         Ok(cmd) => {
+///             match cmd {
+///                 SubmitOrder → ...
+///                 CancelOrder → ...
+///                 ...
+///             }
+///         }
+///         Err(_) => break,
+///     }
+/// }
+/// ```
+/// 
+/// # 우선순위 전략
+/// - 입금 큐 우선: 입금이 선행되어야 주문 가능
+/// - 주문 큐: 입금 큐가 비어있을 때만 처리
+/// 
+/// # 성능
+/// - 주문 처리: < 0.5ms (평균)
+/// - 체결 처리: < 0.2ms (평균)
+/// - TPS: 50,000+ orders/sec
+pub fn engine_thread_loop(
+    order_rx: Receiver<OrderCommand>,
+    balance_rx: Receiver<BalanceCommand>,
+    wal_tx: Option<crossbeam::channel::Sender<WalEntry>>,
+    db_tx: Option<crossbeam::channel::Sender<super::db_commands::DbCommand>>,
+    orderbooks: Arc<RwLock<HashMap<TradingPair, OrderBook>>>,
+    matcher: Arc<Matcher>,
+    executor: Arc<Mutex<Executor>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    db: Option<Database>,
+) {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 1. 코어 고정 (Core 0)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    let config = CoreConfig::from_env();
+    CoreConfig::set_core(Some(config.engine_core));
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 2. 실시간 스케줄링 설정 (우선순위 99)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    CoreConfig::set_realtime_scheduling(99);
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 2. 메인 루프 (우선순위 기반)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    // 채널 닫힘 상태 추적
+    let mut balance_closed = false;
+    let mut order_closed = false;
+    
+    loop {
+        // running 플래그 확인
+        if !running.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        
+        // 두 채널 모두 닫혔으면 종료
+        if balance_closed && order_closed {
+            break;
+        }
+        
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 1. 잔고 업데이트 큐 우선 확인 (논블로킹)
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 입금이 선행되어야 주문이 가능하므로 우선순위를 높게 설정
+        if !balance_closed {
+            match balance_rx.try_recv() {
+            Ok(cmd) => {
+                // 잔고 업데이트 처리
+                match cmd {
+                    BalanceCommand::UpdateBalance { user_id, mint, available_delta, response } => {
+                        handle_update_balance(
+                            user_id,
+                            mint,
+                            available_delta,
+                            response,
+                            wal_tx.as_ref(),
+                            db_tx.as_ref(),
+                            &executor,
+                        );
+                    }
+                }
+                continue; // 다음 루프로 (주문 큐 확인 전에 다시 잔고 큐 확인)
+            }
+            Err(crossbeam::channel::TryRecvError::Empty) => {
+                // 큐가 비어있음, 주문 큐 확인
+            }
+                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    // balance_rx 채널이 닫힘 (sender가 닫혔음)
+                    balance_closed = true;
+                }
+            }
+        }
+        
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 2. 주문 큐 확인 (타임아웃 사용)
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 잔고 큐가 비어있을 때만 주문 처리
+        // 짧은 타임아웃(1ms)을 사용하여 잔고 큐를 주기적으로 확인
+        if !order_closed {
+            use std::time::Duration;
+            match order_rx.recv_timeout(Duration::from_millis(1)) {
+            Ok(cmd) => {
+                // running 플래그 확인 (명령 처리 전)
+                if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                
+                // 명령 처리
+                match cmd {
+                    OrderCommand::SubmitOrder { order, response } => {
+                        handle_submit_order(
+                            order,
+                            response,
+                            wal_tx.as_ref(),
+                            db_tx.as_ref(),
+                            &orderbooks,
+                            &matcher,
+                            &executor,
+                        );
+                    }
+                    OrderCommand::CancelOrder { order_id, user_id, trading_pair, response } => {
+                        handle_cancel_order(
+                            order_id,
+                            user_id,
+                            trading_pair,
+                            response,
+                            wal_tx.as_ref(),
+                            db_tx.as_ref(),
+                            &orderbooks,
+                            &executor,
+                            db.clone(),
+                        );
+                    }
+                    OrderCommand::GetOrderbook { trading_pair, depth, response } => {
+                        handle_get_orderbook(
+                            trading_pair,
+                            depth,
+                            response,
+                            &orderbooks,
+                        );
+                    }
+                    OrderCommand::GetBalance { user_id, mint, response } => {
+                        handle_get_balance(
+                            user_id,
+                            mint,
+                            response,
+                            &executor,
+                        );
+                    }
+                    OrderCommand::LockBalance { user_id, mint, amount, response } => {
+                        handle_lock_balance(
+                            user_id,
+                            mint,
+                            amount,
+                            response,
+                            wal_tx.as_ref(),
+                            db_tx.as_ref(),
+                            &executor,
+                        );
+                    }
+                    OrderCommand::UnlockBalance { user_id, mint, amount, response } => {
+                        handle_unlock_balance(
+                            user_id,
+                            mint,
+                            amount,
+                            response,
+                            wal_tx.as_ref(),
+                            db_tx.as_ref(),
+                            &executor,
+                        );
+                    }
+                }
+            }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    // 타임아웃: 잔고 큐를 다시 확인하기 위해 루프 계속
+                    // 하지만 balance_closed가 true이면 order_rx도 닫혔는지 확인
+                    if balance_closed {
+                        // balance_rx는 이미 닫혔음, order_rx도 닫혔는지 확인
+                        match order_rx.try_recv() {
+                            Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                                // order_rx도 닫혔음
+                                order_closed = true;
+                                break; // 두 채널 모두 닫혔으므로 종료
+                            }
+                            Ok(cmd) => {
+                                // order_rx에 메시지가 있으면 처리
+                                if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
+                                match cmd {
+                                    OrderCommand::SubmitOrder { order, response } => {
+                                        handle_submit_order(
+                                            order,
+                                            response,
+                                            wal_tx.as_ref(),
+                                            db_tx.as_ref(),
+                                            &orderbooks,
+                                            &matcher,
+                                            &executor,
+                                        );
+                                    }
+                                    OrderCommand::CancelOrder { order_id, user_id, trading_pair, response } => {
+                                        handle_cancel_order(
+                                            order_id,
+                                            user_id,
+                                            trading_pair,
+                                            response,
+                                            wal_tx.as_ref(),
+                                            db_tx.as_ref(),
+                                            &orderbooks,
+                                            &executor,
+                                            db.clone(),
+                                        );
+                                    }
+                                    OrderCommand::GetOrderbook { trading_pair, depth, response } => {
+                                        handle_get_orderbook(
+                                            trading_pair,
+                                            depth,
+                                            response,
+                                            &orderbooks,
+                                        );
+                                    }
+                                    OrderCommand::GetBalance { user_id, mint, response } => {
+                                        handle_get_balance(
+                                            user_id,
+                                            mint,
+                                            response,
+                                            &executor,
+                                        );
+                                    }
+                                    OrderCommand::LockBalance { user_id, mint, amount, response } => {
+                                        handle_lock_balance(
+                                            user_id,
+                                            mint,
+                                            amount,
+                                            response,
+                                            wal_tx.as_ref(),
+                                            db_tx.as_ref(),
+                                            &executor,
+                                        );
+                                    }
+                                    OrderCommand::UnlockBalance { user_id, mint, amount, response } => {
+                                        handle_unlock_balance(
+                                            user_id,
+                                            mint,
+                                            amount,
+                                            response,
+                                            wal_tx.as_ref(),
+                                            db_tx.as_ref(),
+                                            &executor,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(crossbeam::channel::TryRecvError::Empty) => {
+                                // order_rx는 비어있지만 아직 열려있음
+                                continue;
+                            }
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    // order_rx 채널이 닫힘 (sender가 닫혔음)
+                    order_closed = true;
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+// =====================================================
+// 명령 처리 핸들러들
+// =====================================================
+
+/// SubmitOrder 명령 처리
+/// 
+/// # 처리 과정
+/// 1. WAL 메시지 발행 (OrderCreated)
+/// 2. OrderBook에 추가
+/// 3. Matcher로 매칭 시도
+/// 4. 체결된 경우 Executor로 처리
+/// 5. MatchResult 목록을 response로 전송
+fn handle_submit_order(
+    order: OrderEntry,
+    response: Option<tokio::sync::oneshot::Sender<Result<Vec<MatchResult>>>>,
+    wal_tx: Option<&crossbeam::channel::Sender<WalEntry>>,
+    db_tx: Option<&crossbeam::channel::Sender<super::db_commands::DbCommand>>,
+    orderbooks: &Arc<RwLock<HashMap<TradingPair, OrderBook>>>,
+    matcher: &Arc<Matcher>,
+    executor: &Arc<Mutex<Executor>>,
+) {
+    let result = process_submit_order(order, wal_tx, db_tx, orderbooks, matcher, executor);
+    
+    // response가 Some인 경우만 응답 전송 (비동기 처리 시 None)
+    if let Some(tx) = response {
+        let _ = tx.send(result);
+    }
+}
+
+pub(crate) fn process_submit_order(
+    mut order: OrderEntry,
+    wal_tx: Option<&crossbeam::channel::Sender<WalEntry>>,
+    db_tx: Option<&crossbeam::channel::Sender<super::db_commands::DbCommand>>,
+    orderbooks: &Arc<RwLock<HashMap<TradingPair, OrderBook>>>,
+    matcher: &Arc<Matcher>,
+    executor: &Arc<Mutex<Executor>>,
+) -> Result<Vec<MatchResult>> {
+    // 1. TradingPair 찾기
+    let pair = TradingPair::new(order.base_mint.clone(), order.quote_mint.clone());
+    
+    // 2. 잔고 잠금 (주문 제출 전에 잠금)
+    {
+        let mut executor_guard = executor.lock();
+        let (lock_mint, lock_amount) = if order.order_type == "buy" {
+            // 매수: quote_mint 잠금
+            // 지정가: price * amount
+            // 시장가: quote_amount
+            let amount = if order.order_side == "market" {
+                // 시장가 매수: quote_amount 사용
+                order.quote_amount.unwrap_or(rust_decimal::Decimal::ZERO)
+            } else {
+                // 지정가 매수: price * amount
+                order.price.unwrap_or(rust_decimal::Decimal::ZERO) * order.amount
+            };
+            (&order.quote_mint, amount)
+        } else {
+            // 매도: base_mint 잠금 (amount만큼)
+            (&order.base_mint, order.amount)
+        };
+        
+        if let Err(e) = executor_guard.lock_balance_for_order(order.id, order.user_id, lock_mint, lock_amount) {
+            // 에러 상세 정보 출력
+            if let Some(balance) = executor_guard.balance_cache().get_balance(order.user_id, lock_mint) {
+                eprintln!(
+                    "Lock failed: user_id={}, mint={}, available={}, locked={}, required={}, error={}",
+                    order.user_id, lock_mint, balance.available, balance.locked, lock_amount, e
+                );
+            } else {
+                eprintln!(
+                    "Lock failed: user_id={}, mint={}, required={}, error={} (balance not found in cache)",
+                    order.user_id, lock_mint, lock_amount, e
+                );
+            }
+            return Err(anyhow::anyhow!("Failed to lock balance: {}", e));
+        }
+        
+        // DB Writer로 잔고 업데이트 명령 전송 (available 감소, locked 증가)
+        if let Some(tx) = db_tx {
+            let db_cmd = super::db_commands::DbCommand::UpdateBalance {
+                user_id: order.user_id,
+                mint: lock_mint.to_string(),
+                available_delta: Some(-lock_amount), // available 감소
+                locked_delta: Some(lock_amount), // locked 증가
+            };
+            if let Err(e) = tx.send(db_cmd) {
+                eprintln!("Failed to send DB update command for balance lock: order_id={}, user_id={}, mint={}, amount={}, error={}",
+                    order.id, order.user_id, lock_mint, lock_amount, e);
+            }
+        }
+    }
+    
+    // 3. WAL 메시지 발행 (OrderCreated) - 잔고 잠금 후!
+    if let Some(tx) = wal_tx {
+        let wal_entry = WalEntry::OrderCreated {
+            order_id: order.id,
+            user_id: order.user_id,
+            order_type: order.order_type.clone(),
+            base_mint: order.base_mint.clone(),
+            quote_mint: order.quote_mint.clone(),
+            price: order.price.map(|p| p.to_string()),
+            amount: order.amount.to_string(),
+            timestamp: order.created_at.timestamp_millis(),
+        };
+        let _ = tx.send(wal_entry);
+    }
+    
+    // 3-1. 주문을 DB에 저장 (배치로 처리됨, trade insert 전에 필요 - 외래키 제약)
+    // 주문 ID는 DB Writer가 INSERT 시 auto increment로 생성됨
+    if let Some(tx) = db_tx {
+        let db_cmd = super::db_commands::DbCommand::InsertOrder {
+            order_id: order.id,  // 임시 ID (0), DB Writer가 실제 ID 생성
+            user_id: order.user_id,
+            order_type: order.order_type.clone(),
+            order_side: order.order_side.clone(),
+            base_mint: order.base_mint.clone(),
+            quote_mint: order.quote_mint.clone(),
+            price: order.price,
+            amount: order.amount,
+            created_at: order.created_at,
+        };
+        let _ = tx.send(db_cmd); // Non-blocking, 배치로 처리됨
+    }
+    
+    // 4. 시장가 주문 여부 및 초기 잔고 잠금 정보 저장 (order 이동 전)
+    let is_market_order = order.order_side == "market";
+    let initial_quote_amount = order.quote_amount;
+    let initial_amount = order.amount;
+    
+    // 5. OrderBook 가져오기 및 매칭 (락 안에서 수행)
+    let (matches, order_after_match) = {
+        let mut orderbooks_guard = orderbooks.write();
+        let orderbook = orderbooks_guard.entry(pair.clone()).or_insert_with(|| OrderBook::new(pair.clone()));
+        
+        // 6. Matcher로 매칭 시도 (먼저 매칭 시도)
+        let matches = matcher.match_order(&mut order, orderbook);
+        
+        // 7. 매칭 후 남은 주문이 있으면 OrderBook에 추가
+        // 시장가 주문은 완전히 체결되지 않으면 오더북에 추가하지 않음 (시장가 주문은 즉시 체결되어야 함)
+        // 지정가 주문은 부분 체결 후 남은 수량이 있으면 오더북에 추가
+        if order.order_side == "limit" {
+            // 지정가 주문: 남은 수량이 있으면 오더북에 추가
+            let has_remaining = if let Some(remaining_quote) = order.remaining_quote_amount {
+                remaining_quote > Decimal::ZERO
+            } else {
+                order.remaining_amount > Decimal::ZERO
+            };
+            
+            if has_remaining {
+                orderbook.add_order(order.clone()); // order는 나중에 사용하므로 클론
+            }
+        }
+        // 시장가 주문은 완전히 체결되지 않으면 오더북에 추가하지 않음
+        
+        // order 상태 저장 (매칭 후)
+        let order_after_match = order.clone();
+        (matches, order_after_match)
+    };
+    
+    // 8. 시장가 주문 처리 (IOC 방식: 오더북에 있는 만큼만 체결, 남은 잔량은 즉시 취소)
+    // 시장가 주문은 부분 체결되어도 성공으로 처리하고 'filled' 상태로 저장
+    if is_market_order {
+        // 체결 처리
+        {
+            let mut executor_guard = executor.lock();
+            for match_result in &matches {
+                if let Err(e) = executor_guard.execute_trade(match_result) {
+                    eprintln!("Failed to execute trade: {}", e);
+                }
+            }
+        }
+        
+        // 남은 잔고 잠금 해제 (IOC: 남은 잔량은 즉시 취소)
+        {
+            let mut executor_guard = executor.lock();
+            let (unlock_mint, unlock_amount) = if order_after_match.order_type == "buy" {
+                // 시장가 매수: 남은 quote_amount만큼 USDT 잠금 해제
+                let remaining = order_after_match.remaining_quote_amount.unwrap_or(Decimal::ZERO);
+                (&order_after_match.quote_mint, remaining)
+            } else {
+                // 시장가 매도: 남은 amount만큼 SOL 등 잠금 해제
+                (&order_after_match.base_mint, order_after_match.remaining_amount)
+            };
+            
+            if unlock_amount > Decimal::ZERO {
+                // 메모리 잔고 잠금 해제
+                if let Err(e) = executor_guard.unlock_balance_for_cancel(
+                    order_after_match.id,
+                    order_after_match.user_id,
+                    unlock_mint,
+                    unlock_amount,
+                ) {
+                    eprintln!("Failed to unlock balance: {}", e);
+                } else {
+                    // DB Writer로 잔고 업데이트 명령 전송 (locked 감소, available 증가)
+                    if let Some(tx) = db_tx {
+                        let db_cmd = super::db_commands::DbCommand::UpdateBalance {
+                            user_id: order_after_match.user_id,
+                            mint: unlock_mint.to_string(),
+                            available_delta: Some(unlock_amount), // available 증가
+                            locked_delta: Some(-unlock_amount), // locked 감소
+                        };
+                        if let Err(e) = tx.send(db_cmd) {
+                            eprintln!("Failed to send DB update command for unlock: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 시장가 주문 상태를 'filled'로 저장 (부분 체결이어도 filled로 표시)
+        if let Some(tx) = db_tx {
+            let total_filled_amount: Decimal = matches.iter()
+                .map(|m| m.amount)
+                .sum();
+            let total_filled_quote_amount: Decimal = matches.iter()
+                .map(|m| m.price * m.amount)
+                .sum();
+            
+            let db_cmd = super::db_commands::DbCommand::UpdateOrderStatus {
+                order_id: order_after_match.id,
+                status: "filled".to_string(),
+                filled_amount: total_filled_amount,
+                filled_quote_amount: total_filled_quote_amount,
+            };
+            if let Err(e) = tx.send(db_cmd) {
+                eprintln!(
+                    "[Order Submit] Failed to send UpdateOrderStatus command for market order {}: {}",
+                    order_after_match.id, e
+                );
+            }
+        }
+        
+        // 시장가 주문은 항상 성공으로 처리 (IOC 방식)
+        return Ok(matches);
+    }
+    
+    // 8. 체결 처리 (정상 케이스: 지정가 주문)
+    {
+        let mut executor_guard = executor.lock();
+        for match_result in &matches {
+            if let Err(e) = executor_guard.execute_trade(match_result) {
+                // 에러 발생 시 로그 기록
+                eprintln!("Failed to execute trade: {}", e);
+            }
+        }
+    }
+    
+    // 8-1. 지정가 주문 부분 체결 시 상태 업데이트
+    // ============================================
+    // 지정가 주문은 부분 체결되어도 OrderBook에 남아있음
+    // 부분 체결 시 상태를 'partial'로 업데이트해야 함
+    // ============================================
+    if !is_market_order && !matches.is_empty() {
+        // 지정가 주문이고 체결이 발생했음
+        let is_partially_filled = order_after_match.remaining_amount > Decimal::ZERO;
+        
+        if is_partially_filled {
+            // 부분 체결: 상태를 'partial'로 업데이트
+            if let Some(tx) = db_tx {
+                let total_filled_amount: Decimal = matches.iter()
+                    .map(|m| m.amount)
+                    .sum();
+                let total_filled_quote_amount: Decimal = matches.iter()
+                    .map(|m| m.price * m.amount)
+                    .sum();
+                
+                let db_cmd = super::db_commands::DbCommand::UpdateOrderStatus {
+                    order_id: order_after_match.id,
+                    status: "partial".to_string(),
+                    filled_amount: total_filled_amount,
+                    filled_quote_amount: total_filled_quote_amount,
+                };
+                if let Err(e) = tx.send(db_cmd) {
+                    eprintln!(
+                        "[Order Submit] Failed to send UpdateOrderStatus command for partially filled order {}: {}",
+                        order_after_match.id, e
+                    );
+                }
+            }
+        }
+    }
+    
+    // 9. 완전히 체결된 지정가 주문의 남은 locked 잔고 해제
+    // ============================================
+    // 주문 생성 시 lock한 금액과 실제 체결 금액이 다를 수 있음
+    // 
+    // 예시 (지정가 매수 완전 체결):
+    // - 주문 생성 시: price * amount = 100 * 10 = 1000 USDT를 lock
+    // - 실제 체결: 100 * 10 = 1000 USDT 체결 (remaining_amount = 0, 완전 체결)
+    // - transfer로 1000 USDT를 locked에서 차감
+    // - 남은 locked = 0 (정확히 일치)
+    // 
+    // 하지만 가격이 변동하거나 부분 체결 후 완전 체결되면 차이가 있을 수 있음
+    // 따라서 완전히 체결된 주문의 경우 남은 locked를 unlock해야 함
+    // 
+    // 참고: 시장가 주문은 위에서 이미 처리됨 (IOC 방식)
+    // ============================================
+    
+    // 완전 체결 판단 로직 (지정가 주문만)
+    // 지정가 주문: remaining_amount가 0이면 완전 체결
+    let is_fully_filled_after_match = order_after_match.remaining_amount == Decimal::ZERO;
+    
+    // 완전히 체결된 주문의 경우, 남은 locked 잔고 해제
+    if is_fully_filled_after_match {
+        let mut executor_guard = executor.lock();
+        
+        // 주문 타입에 따라 unlock할 mint와 amount 계산
+        let (unlock_mint, unlock_amount) = if order_after_match.order_type == "buy" {
+            // 매수 주문: quote_mint (USDT) 잠금 해제
+            // lock한 금액과 실제 체결 금액의 차이를 계산
+            let total_quote_used: Decimal = matches.iter()
+                .map(|m| m.price * m.amount)
+                .sum();
+            
+            if order_after_match.order_side == "market" {
+                // 시장가 매수: initial_quote_amount에서 실제 체결 금액을 뺀 나머지
+                // remaining_quote_amount가 None이어도 처리 가능
+                let initial_locked = initial_quote_amount.unwrap_or(Decimal::ZERO);
+                let remaining_locked = initial_locked - total_quote_used;
+                (&order_after_match.quote_mint, remaining_locked)
+            } else {
+                // 지정가 매수: price * initial_amount에서 실제 체결 금액을 뺀 나머지
+                let initial_locked = order_after_match.price.unwrap_or(Decimal::ZERO) * initial_amount;
+                let remaining_locked = initial_locked - total_quote_used;
+                (&order_after_match.quote_mint, remaining_locked)
+            }
+        } else {
+            // 매도 주문: base_mint (SOL 등) 잠금 해제
+            // lock한 수량과 실제 체결 수량의 차이를 계산
+            let total_amount_used: Decimal = matches.iter()
+                .map(|m| m.amount)
+                .sum();
+            let remaining_locked = initial_amount - total_amount_used;
+            (&order_after_match.base_mint, remaining_locked)
+        };
+        
+        // 남은 locked가 있으면 unlock (0보다 큰 경우에만)
+        if unlock_amount > Decimal::ZERO {
+            if let Err(e) = executor_guard.unlock_balance_for_cancel(
+                order_after_match.id,
+                order_after_match.user_id,
+                unlock_mint,
+                unlock_amount,
+            ) {
+                eprintln!(
+                    "[Order Submit] Failed to unlock remaining balance for fully filled order {}: user_id={}, mint={}, amount={}, error={}",
+                    order_after_match.id, order_after_match.user_id, unlock_mint, unlock_amount, e
+                );
+            } else {
+                // Unlock 성공 시 DB Writer로 잔고 업데이트 명령 전송
+                // 남은 locked를 available로 이동 (available 증가, locked 감소)
+                if let Some(tx) = db_tx {
+                    let db_cmd = super::db_commands::DbCommand::UpdateBalance {
+                        user_id: order_after_match.user_id,
+                        mint: unlock_mint.to_string(),
+                        available_delta: Some(unlock_amount), // available 증가
+                        locked_delta: Some(-unlock_amount), // locked 감소
+                    };
+                    if let Err(e) = tx.send(db_cmd) {
+                        eprintln!(
+                            "[Order Submit] Failed to send UpdateBalance command for unlock: order_id={}, user_id={}, mint={}, amount={}, error={}",
+                            order_after_match.id, order_after_match.user_id, unlock_mint, unlock_amount, e
+                        );
+                    }
+                }
+            }
+        }
+        
+        // 완전히 체결된 주문의 상태를 'filled'로 업데이트
+        // DB Writer로 주문 상태 업데이트 명령 전송
+        if let Some(tx) = db_tx {
+            let total_filled_amount: Decimal = matches.iter()
+                .map(|m| m.amount)
+                .sum();
+            let total_filled_quote_amount: Decimal = matches.iter()
+                .map(|m| m.price * m.amount)
+                .sum();
+            
+            let db_cmd = super::db_commands::DbCommand::UpdateOrderStatus {
+                order_id: order_after_match.id,
+                status: "filled".to_string(),
+                filled_amount: total_filled_amount,
+                filled_quote_amount: total_filled_quote_amount,
+            };
+            if let Err(e) = tx.send(db_cmd) {
+                eprintln!(
+                    "[Order Submit] Failed to send UpdateOrderStatus command for order {}: {}",
+                    order_after_match.id, e
+                );
+            }
+        }
+    }
+    
+    Ok(matches)
+}
+
+/// CancelOrder 명령 처리
+/// 
+/// # 처리 과정
+/// 1. OrderBook에서 주문 찾기
+/// 2. 권한 확인 (user_id 일치)
+/// 3. WAL 메시지 발행 (OrderCancelled)
+/// 4. OrderBook에서 제거
+/// 5. 잔고 잠금 해제 (remaining_amount만큼)
+/// 6. 취소된 주문 반환
+fn handle_cancel_order(
+    order_id: u64,
+    user_id: u64,
+    trading_pair: TradingPair,
+    response: tokio::sync::oneshot::Sender<Result<OrderEntry>>,
+    wal_tx: Option<&crossbeam::channel::Sender<WalEntry>>,
+    db_tx: Option<&crossbeam::channel::Sender<super::db_commands::DbCommand>>,
+    orderbooks: &Arc<RwLock<HashMap<TradingPair, OrderBook>>>,
+    executor: &Arc<Mutex<Executor>>,
+    db: Option<Database>,
+) {
+    // 1. OrderBook에서 주문 찾기
+    let mut orderbooks_guard = orderbooks.write();
+    let orderbook = match orderbooks_guard.get_mut(&trading_pair) {
+        Some(ob) => ob,
+        None => {
+            let _ = response.send(Err(anyhow::anyhow!("OrderBook not found for trading pair")));
+            return;
+        }
+    };
+    
+    // 2. 주문 찾기 (매수/매도 양쪽 모두 확인)
+    let mut found_order: Option<OrderEntry> = None;
+    let mut found_price: Option<rust_decimal::Decimal> = None;
+    let mut is_buy = false;
+    
+    // 매수 호가에서 찾기
+    for (price, orders) in orderbook.buy_orders.orders.iter_mut() {
+        if let Some(pos) = orders.iter().position(|o| o.id == order_id) {
+            if let Some(order) = orders.remove(pos) {
+                // 권한 확인
+                if order.user_id == user_id {
+                    found_order = Some(order.clone());
+                    found_price = Some(*price);
+                    is_buy = true;
+                    if orders.is_empty() {
+                        // 빈 VecDeque는 나중에 제거
+                    }
+                    break;
+                } else {
+                    // 권한 없음 - 다시 추가
+                    orders.insert(pos, order);
+                    let _ = response.send(Err(anyhow::anyhow!("Unauthorized: You don't own this order")));
+                    return;
+                }
+            }
+        }
+    }
+    
+    // 매도 호가에서 찾기
+    if found_order.is_none() {
+        for (price, orders) in orderbook.sell_orders.orders.iter_mut() {
+            if let Some(pos) = orders.iter().position(|o| o.id == order_id) {
+                if let Some(order) = orders.remove(pos) {
+                    // 권한 확인
+                    if order.user_id == user_id {
+                        found_order = Some(order.clone());
+                        found_price = Some(*price);
+                        is_buy = false;
+                        if orders.is_empty() {
+                            // 빈 VecDeque는 나중에 제거
+                        }
+                        break;
+                    } else {
+                        // 권한 없음 - 다시 추가
+                        orders.insert(pos, order);
+                        let _ = response.send(Err(anyhow::anyhow!("Unauthorized: You don't own this order")));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    
+    // 빈 VecDeque 제거
+    if let Some(price) = found_price {
+        if is_buy {
+            if let Some(orders) = orderbook.buy_orders.orders.get(&price) {
+                if orders.is_empty() {
+                    orderbook.buy_orders.orders.remove(&price);
+                }
+            }
+        } else {
+            if let Some(orders) = orderbook.sell_orders.orders.get(&price) {
+                if orders.is_empty() {
+                    orderbook.sell_orders.orders.remove(&price);
+                }
+            }
+        }
+    }
+    
+    let order_type = found_order.as_ref().map(|o| o.order_type.clone());
+    
+    // 3. OrderBook에서 찾지 못했으면 DB에서 조회
+    let (order, from_db) = match found_order {
+        Some(o) => (o, false),
+        None => {
+            // OrderBook에서 찾지 못함 - DB에서 조회
+            if let Some(db) = db {
+                use crate::shared::database::repositories::cex::order_repository::OrderRepository;
+                let order_repo = OrderRepository::new(db.pool().clone());
+                
+                // DB에서 주문 조회
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        match handle.block_on(order_repo.get_by_id(order_id)) {
+                            Ok(Some(db_order)) => {
+                                // 권한 확인
+                                if db_order.user_id != user_id {
+                                    let _ = response.send(Err(anyhow::anyhow!("Unauthorized: You don't own this order")));
+                                    return;
+                                }
+                                
+                                // 완전히 체결된 주문은 취소 불가
+                                if db_order.status == "filled" {
+                                    let _ = response.send(Err(anyhow::anyhow!("Cannot cancel order: Order is already filled")));
+                                    return;
+                                }
+                                
+                                // 취소된 주문은 취소 불가
+                                if db_order.status == "cancelled" {
+                                    let _ = response.send(Err(anyhow::anyhow!("Cannot cancel order: Order is already cancelled")));
+                                    return;
+                                }
+                                
+                                // DB 주문을 OrderEntry로 변환
+                                let order_entry = OrderEntry {
+                                    id: db_order.id,
+                                    user_id: db_order.user_id,
+                                    order_type: db_order.order_type,
+                                    order_side: db_order.order_side,
+                                    base_mint: db_order.base_mint,
+                                    quote_mint: db_order.quote_mint,
+                                    price: db_order.price,
+                                    amount: db_order.amount,
+                                    quote_amount: None, // DB Order에는 quote_amount 필드가 없으므로 None
+                                    filled_amount: db_order.filled_amount,
+                                    remaining_amount: db_order.amount - db_order.filled_amount,
+                                    remaining_quote_amount: None,
+                                    created_at: db_order.created_at,
+                                };
+                                
+                                // DB에서 주문을 찾았으므로 취소 처리 계속 진행
+                                (order_entry, true)
+                            }
+                            Ok(None) => {
+                                let _ = response.send(Err(anyhow::anyhow!("Order not found")));
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = response.send(Err(anyhow::anyhow!("Failed to query order from database: {}", e)));
+                                return;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Tokio 런타임이 없으면 DB 조회 불가
+                        let _ = response.send(Err(anyhow::anyhow!("Order not found in OrderBook and cannot query database")));
+                        return;
+                    }
+                }
+            } else {
+                // DB가 없으면 OrderBook에서만 찾기
+                let _ = response.send(Err(anyhow::anyhow!("Order not found")));
+                return;
+            }
+        }
+    };
+    
+    // 3. WAL 메시지 발행 (OrderCancelled)
+    if let Some(tx) = wal_tx {
+        let wal_entry = WalEntry::OrderCancelled {
+            order_id,
+            user_id,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+        let _ = tx.send(wal_entry);
+    }
+    
+    // 4. 잔고 잠금 해제 (remaining_amount만큼)
+    let order_type_str = order.order_type.as_str();
+    let unlock_mint = if order_type_str == "buy" {
+        &order.quote_mint  // 매수: USDT 잠금 해제
+    } else {
+        &order.base_mint   // 매도: SOL 등 잠금 해제
+    };
+    
+    // 잠금 해제할 금액 계산
+    let unlock_amount = if order_type_str == "buy" {
+        // 매수: price * remaining_amount
+        order.price.unwrap_or(rust_decimal::Decimal::ZERO) * order.remaining_amount
+    } else {
+        // 매도: remaining_amount
+        order.remaining_amount
+    };
+    
+    // Executor로 잔고 잠금 해제
+    {
+        let mut executor_guard = executor.lock();
+        if let Err(e) = executor_guard.unlock_balance_for_cancel(order_id, user_id, unlock_mint, unlock_amount) {
+            let _ = response.send(Err(anyhow::anyhow!("Failed to unlock balance: {}", e)));
+            return;
+        }
+    }
+    
+    // 5. DB에 주문 상태 업데이트 (cancelled)
+    if let Some(tx) = db_tx {
+        let db_cmd = super::db_commands::DbCommand::UpdateOrderStatus {
+            order_id,
+            status: "cancelled".to_string(),
+            filled_amount: order.filled_amount,
+            filled_quote_amount: Decimal::ZERO, // 취소 시 filled_quote_amount는 0으로 유지 (이미 체결된 금액은 그대로)
+        };
+        if let Err(e) = tx.send(db_cmd) {
+            eprintln!("Failed to send UpdateOrderStatus command for cancel: {}", e);
+        }
+    }
+    
+    // 6. 잔고 업데이트를 DB에 반영 (unlock)
+    if let Some(tx) = db_tx {
+        let db_cmd = super::db_commands::DbCommand::UpdateBalance {
+            user_id,
+            mint: unlock_mint.to_string(),
+            available_delta: Some(unlock_amount), // available 증가
+            locked_delta: Some(-unlock_amount), // locked 감소
+        };
+        if let Err(e) = tx.send(db_cmd) {
+            eprintln!("Failed to send UpdateBalance command for unlock: {}", e);
+        }
+    }
+    
+    // 7. 취소된 주문 반환
+    let _ = response.send(Ok(order));
+}
+
+/// GetOrderbook 명령 처리
+/// 
+/// # 처리 과정
+/// 1. OrderBook 찾기
+/// 2. 매수 주문 목록 수집 (depth만큼)
+/// 3. 매도 주문 목록 수집 (depth만큼)
+/// 4. 결과 반환
+/// 
+/// # Note
+/// depth가 None이면 전체 주문 반환 (주의: 많은 주문이 있으면 느릴 수 있음)
+fn handle_get_orderbook(
+    trading_pair: TradingPair,
+    depth: Option<usize>,
+    response: tokio::sync::oneshot::Sender<Result<(Vec<OrderEntry>, Vec<OrderEntry>)>>,
+    orderbooks: &Arc<RwLock<HashMap<TradingPair, OrderBook>>>,
+) {
+    // 1. OrderBook 찾기
+    let orderbooks_guard = orderbooks.read();
+    let orderbook = match orderbooks_guard.get(&trading_pair) {
+        Some(ob) => ob,
+        None => {
+            // OrderBook이 없으면 빈 목록 반환
+            let _ = response.send(Ok((Vec::new(), Vec::new())));
+            return;
+        }
+    };
+    
+    // 2. 매수 주문 목록 수집
+    let mut buy_orders = Vec::new();
+    for (_, orders) in orderbook.buy_orders.orders.iter().rev() {
+        for order in orders.iter() {
+            buy_orders.push(order.clone());
+            if let Some(d) = depth {
+                if buy_orders.len() >= d {
+                    break;
+                }
+            }
+        }
+        if let Some(d) = depth {
+            if buy_orders.len() >= d {
+                break;
+            }
+        }
+    }
+    
+    // 3. 매도 주문 목록 수집
+    let mut sell_orders = Vec::new();
+    for (_, orders) in orderbook.sell_orders.orders.iter() {
+        for order in orders.iter() {
+            sell_orders.push(order.clone());
+            if let Some(d) = depth {
+                if sell_orders.len() >= d {
+                    break;
+                }
+            }
+        }
+        if let Some(d) = depth {
+            if sell_orders.len() >= d {
+                break;
+            }
+        }
+    }
+    
+    // 4. 결과 반환
+    let _ = response.send(Ok((buy_orders, sell_orders)));
+}
+
+/// GetBalance 명령 처리
+fn handle_get_balance(
+    user_id: u64,
+    mint: String,
+    response: tokio::sync::oneshot::Sender<Result<(rust_decimal::Decimal, rust_decimal::Decimal)>>,
+    executor: &Arc<Mutex<Executor>>,
+) {
+    let executor = executor.lock();
+    let balance_cache = executor.balance_cache();
+    
+    match balance_cache.get_balance(user_id, &mint) {
+        Some(balance) => {
+            let _ = response.send(Ok((balance.available, balance.locked)));
+        }
+        None => {
+            let _ = response.send(Ok((rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO)));
+        }
+    }
+}
+
+/// LockBalance 명령 처리
+fn handle_lock_balance(
+    user_id: u64,
+    mint: String,
+    amount: rust_decimal::Decimal,
+    response: tokio::sync::oneshot::Sender<Result<()>>,
+    wal_tx: Option<&crossbeam::channel::Sender<WalEntry>>,
+    db_tx: Option<&crossbeam::channel::Sender<super::db_commands::DbCommand>>,
+    executor: &Arc<Mutex<Executor>>,
+) {
+    let mut executor = executor.lock();
+    
+    // WAL 메시지는 executor.lock_balance_for_order에서 발행하므로 여기서는 제거 (중복 방지)
+    
+    // 잔고 잠금
+    match executor.lock_balance_for_order(0, user_id, &mint, amount) {
+        Ok(()) => {
+            // DB Writer로 잔고 업데이트 명령 전송 (available 감소, locked 증가)
+            if let Some(tx) = db_tx {
+                let db_cmd = super::db_commands::DbCommand::UpdateBalance {
+                    user_id,
+                    mint: mint.clone(),
+                    available_delta: Some(-amount), // available 감소
+                    locked_delta: Some(amount), // locked 증가
+                };
+                let _ = tx.send(db_cmd);
+            }
+            
+            let _ = response.send(Ok(()));
+        }
+        Err(e) => {
+            let _ = response.send(Err(e));
+        }
+    }
+}
+
+/// UnlockBalance 명령 처리
+fn handle_unlock_balance(
+    user_id: u64,
+    mint: String,
+    amount: rust_decimal::Decimal,
+    response: tokio::sync::oneshot::Sender<Result<()>>,
+    wal_tx: Option<&crossbeam::channel::Sender<WalEntry>>,
+    db_tx: Option<&crossbeam::channel::Sender<super::db_commands::DbCommand>>,
+    executor: &Arc<Mutex<Executor>>,
+) {
+    let mut executor = executor.lock();
+    
+    // WAL 메시지 발행
+    if let Some(tx) = wal_tx {
+        let wal_entry = WalEntry::OrderCancelled {
+            order_id: 0,  // TODO: 실제 order_id 전달
+            user_id,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+        let _ = tx.send(wal_entry);
+    }
+    
+    // 잔고 잠금 해제
+    match executor.unlock_balance_for_cancel(0, user_id, &mint, amount) {
+        Ok(()) => {
+            // DB Writer로 잔고 업데이트 명령 전송 (locked 감소, available 증가)
+            if let Some(tx) = db_tx {
+                let db_cmd = super::db_commands::DbCommand::UpdateBalance {
+                    user_id,
+                    mint: mint.clone(),
+                    available_delta: Some(amount), // available 증가
+                    locked_delta: Some(-amount), // locked 감소
+                };
+                let _ = tx.send(db_cmd);
+            }
+            
+            let _ = response.send(Ok(()));
+        }
+        Err(e) => {
+            let _ = response.send(Err(e));
+        }
+    }
+}
+
+/// UpdateBalance 명령 처리 (입금/출금)
+/// 
+/// # 처리 과정
+/// 1. BalanceCache에서 잔고 조회/생성
+/// 2. available 업데이트 (기존 + delta)
+/// 3. WAL 메시지 발행 (BalanceUpdated)
+/// 4. DB 명령 전송 (UpdateBalance) → DB Writer가 배치로 처리
+/// 5. 성공/실패 결과를 response로 전송
+/// 
+/// # Arguments
+/// * `user_id` - 사용자 ID
+/// * `mint` - 자산 종류 (예: "SOL", "USDT")
+/// * `available_delta` - available 증감량 (양수: 입금, 음수: 출금)
+/// * `response` - 결과를 반환할 oneshot 채널
+/// * `wal_tx` - WAL 메시지 전송 채널
+/// * `db_tx` - DB 명령 전송 채널
+/// * `executor` - Executor (BalanceCache 포함)
+/// 
+/// # 예시
+/// ```rust
+/// // 100 USDT 입금
+/// handle_update_balance(
+///     123,
+///     "USDT".to_string(),
+///     Decimal::new(100, 0),
+///     response,
+///     wal_tx,
+///     db_tx,
+///     &executor,
+/// );
+/// ```
+fn handle_update_balance(
+    user_id: u64,
+    mint: String,
+    available_delta: rust_decimal::Decimal,
+    response: tokio::sync::oneshot::Sender<Result<()>>,
+    wal_tx: Option<&crossbeam::channel::Sender<WalEntry>>,
+    db_tx: Option<&crossbeam::channel::Sender<super::db_commands::DbCommand>>,
+    executor: &Arc<Mutex<Executor>>,
+) {
+    // 1. BalanceCache에서 잔고 업데이트
+    let (new_available, new_locked) = {
+        let mut executor_guard = executor.lock();
+        let balance_cache = executor_guard.balance_cache_mut();
+        
+        // available 업데이트 (delta 추가)
+        balance_cache.add_available(user_id, &mint, available_delta);
+        
+        // 업데이트 후 잔고 조회 (WAL 기록용)
+        let new_balance = balance_cache.get_balance(user_id, &mint)
+            .cloned()
+            .unwrap_or_else(|| crate::domains::cex::engine::balance_cache::Balance::new());
+        
+        (new_balance.available, new_balance.locked)
+    };
+    
+    // 2. WAL 메시지 발행 (BalanceUpdated)
+    // 업데이트 후 잔고를 기록하여 복구 시 정확한 상태 복원 가능
+    if let Some(tx) = wal_tx {
+        let wal_entry = WalEntry::BalanceUpdated {
+            user_id,
+            mint: mint.clone(),
+            available: new_available.to_string(),
+            locked: new_locked.to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+        let _ = tx.send(wal_entry);
+    }
+    
+    // 3. DB 명령 전송 (UpdateBalance)
+    // DB Writer 스레드가 배치로 처리 (100개 또는 10ms마다)
+    if let Some(tx) = db_tx {
+        let db_cmd = super::db_commands::DbCommand::UpdateBalance {
+            user_id,
+            mint: mint.clone(),
+            available_delta: Some(available_delta),
+            locked_delta: None,  // 입금/출금은 available만 변경
+        };
+        let _ = tx.send(db_cmd);
+    }
+    
+    // 4. 성공 결과 반환
+    let _ = response.send(Ok(()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use rust_decimal::Decimal;
+
+    fn sample_limit_buy(order_id: u64, user_id: u64) -> OrderEntry {
+        OrderEntry {
+            id: order_id,
+            user_id,
+            order_type: "buy".to_string(),
+            order_side: "limit".to_string(),
+            base_mint: "SOL".to_string(),
+            quote_mint: "USDT".to_string(),
+            price: Some(Decimal::new(100, 0)),
+            amount: Decimal::new(1, 0),
+            quote_amount: None,
+            filled_amount: Decimal::ZERO,
+            remaining_amount: Decimal::new(1, 0),
+            remaining_quote_amount: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn submit_order_without_persistence_channels() {
+        let orderbooks = Arc::new(RwLock::new(HashMap::new()));
+        let matcher = Arc::new(Matcher::new());
+        let executor = Arc::new(Mutex::new(Executor::new_without_wal()));
+
+        {
+            let mut exec = executor.lock();
+            exec.balance_cache_mut()
+                .set_balance(1, "USDT", Decimal::new(10_000, 0), Decimal::ZERO);
+        }
+
+        let order = sample_limit_buy(1, 1);
+        let result =
+            super::process_submit_order(order, None, None, &orderbooks, &matcher, &executor).unwrap();
+        assert!(result.is_empty());
+
+        let books = orderbooks.read();
+        assert_eq!(books.len(), 1);
+    }
+}
+
+// =====================================================
+// WAL 스레드 루프
+// =====================================================
+// 역할: WAL 메시지를 받아서 디스크에 순차 쓰기
+//
+// 처리 과정:
+// 1. 코어 고정 (Core 1)
+// 2. WalWriter 생성
+// 3. WAL 메시지 수신 루프
+// 4. WalWriter::append() 호출
+// 5. 주기적 fsync()
+// =====================================================
+
+/// WAL 스레드 메인 루프
+/// 
+/// # Arguments
+/// * `wal_rx` - WAL 메시지 수신 채널
+/// * `wal_dir` - WAL 디렉토리 경로
+/// 
+/// # 처리 흐름
+/// ```
+/// loop {
+///     wal_rx.recv() → WalEntry
+///         ↓
+///     WalWriter::append(entry)
+///         ↓
+///     (10개마다) fsync()
+/// }
+/// ```
+pub fn wal_thread_loop(
+    wal_rx: Receiver<WalEntry>,
+    wal_dir: std::path::PathBuf,
+) {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 1. 코어 고정 (Core 1)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    let config = CoreConfig::from_env();
+    CoreConfig::set_core(Some(config.wal_core));
+    
+    // WAL 스레드는 실시간 스케줄링 불필요 (I/O 바운드)
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 2. WalWriter 생성
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    let mut wal_writer = match WalWriter::new(&wal_dir, 10) {
+        Ok(writer) => writer,
+        Err(e) => {
+            eprintln!("Failed to create WalWriter: {}", e);
+            return;
+        }
+    };
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 3. 메인 루프
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    loop {
+        match wal_rx.recv() {
+            Ok(entry) => {
+                // WAL 파일에 쓰기
+                if let Err(e) = wal_writer.append(&entry) {
+                    eprintln!("Failed to write to WAL: {}", e);
+                }
+            }
+            Err(_) => {
+                // 채널이 닫힘 (정상 종료)
+                // 마지막 동기화
+                let _ = wal_writer.sync();
+                break;
+            }
+        }
+    }
+}
+
+// =====================================================
+// DB Writer 스레드 루프
+// =====================================================
+// 역할: 메모리에서 DB 명령을 받아서 배치로 DB에 저장
+//
+// 처리 과정:
+// 1. 코어 고정 (Core 2, dev 환경만)
+// 2. DB 명령 수신 루프
+// 3. 배치로 모으기 (10ms 또는 100개)
+// 4. DB에 배치 쓰기 (트랜잭션)
+// =====================================================
+
+/// DB Writer 스레드 메인 루프
+/// 
+/// # Arguments
+/// * `db_rx` - DB 명령 수신 채널
+/// * `db_pool` - 데이터베이스 연결 풀
+/// 
+/// # 처리 흐름
+/// ```
+/// loop {
+///     db_rx.recv() → DbCommand
+///         ↓
+///     batch.push(cmd)
+///         ↓
+///     (10ms 또는 100개마다)
+///         ↓
+///     db.execute_batch(&batch)
+/// }
+/// ```
+/// 
+/// # 배치 전략
+/// - 시간 기반: 10ms마다 배치 쓰기
+/// - 크기 기반: 100개 모이면 즉시 쓰기
+/// - 트랜잭션: 여러 작업을 하나의 트랜잭션으로 묶기
+pub fn db_writer_thread_loop(
+    db_rx: Receiver<super::db_commands::DbCommand>,
+    db_pool: PgPool,
+) {
+    use super::db_commands::DbCommand;
+    use std::time::{Duration, Instant};
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 1. 코어 고정 (Core 2, dev 환경만)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    let config = CoreConfig::from_env();
+    if let Some(core) = config.db_writer_core {
+        CoreConfig::set_core(Some(core));
+    }
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 2. 배치 변수 초기화
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    let mut batch = Vec::new();
+    let batch_size_limit = 100;
+    let batch_time_limit = Duration::from_millis(10);
+    let mut last_flush = Instant::now();
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 3. 메인 루프 (Tokio 런타임 필요)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    // Tokio 런타임 생성 (DB 작업은 async이므로)
+    let rt = tokio::runtime::Runtime::new()
+        .expect("Failed to create Tokio runtime for DB Writer");
+    
+    rt.block_on(async {
+        loop {
+            // 채널이 닫혔는지 먼저 확인 (논블로킹, 즉시 반환)
+            match db_rx.try_recv() {
+                Ok(cmd) => {
+                    // 명령 수신
+                    batch.push(cmd);
+                    
+                    // 크기 기반 배치 쓰기 (100개 모이면)
+                    if batch.len() >= batch_size_limit {
+                        if let Err(e) = flush_batch(&mut batch, &db_pool).await {
+                            eprintln!("Failed to flush DB batch: {}", e);
+                        }
+                        last_flush = Instant::now();
+                    }
+                    continue; // 다음 루프로
+                }
+                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    // 채널이 닫힘 (정상 종료) - 즉시 감지
+                    // 마지막 배치 쓰기
+                    if !batch.is_empty() {
+                        let _ = flush_batch(&mut batch, &db_pool).await;
+                    }
+                    break;
+                }
+                Err(crossbeam::channel::TryRecvError::Empty) => {
+                    // 채널이 비어있지만 아직 열려있음
+                    // 타임아웃 설정 (10ms)
+                    let timeout = batch_time_limit.saturating_sub(last_flush.elapsed());
+                    
+                    if timeout == Duration::ZERO {
+                        // 시간 기반 배치 쓰기 (10ms 경과)
+                        if !batch.is_empty() {
+                            if let Err(e) = flush_batch(&mut batch, &db_pool).await {
+                                eprintln!("Failed to flush DB batch: {}", e);
+                            }
+                            last_flush = Instant::now();
+                        }
+                        // 채널이 닫혔는지 다시 확인 (논블로킹)
+                        match db_rx.try_recv() {
+                            Ok(cmd) => {
+                                batch.push(cmd);
+                                continue;
+                            }
+                            Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                                // 채널이 닫힘
+                                if !batch.is_empty() {
+                                    let _ = flush_batch(&mut batch, &db_pool).await;
+                                }
+                                break;
+                            }
+                            Err(crossbeam::channel::TryRecvError::Empty) => {
+                                // 여전히 비어있음 - 매우 짧은 대기 후 다시 확인
+                                tokio::time::sleep(Duration::from_micros(100)).await;
+                            }
+                        }
+                    } else {
+                        // 타임아웃까지 대기
+                        match db_rx.recv_timeout(timeout) {
+                            Ok(cmd) => {
+                                batch.push(cmd);
+                                if batch.len() >= batch_size_limit {
+                                    if let Err(e) = flush_batch(&mut batch, &db_pool).await {
+                                        eprintln!("Failed to flush DB batch: {}", e);
+                                    }
+                                    last_flush = Instant::now();
+                                }
+                            }
+                            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                                // 시간 기반 배치 쓰기 (10ms 경과)
+                                if !batch.is_empty() {
+                                    if let Err(e) = flush_batch(&mut batch, &db_pool).await {
+                                        eprintln!("Failed to flush DB batch: {}", e);
+                                    }
+                                    last_flush = Instant::now();
+                                }
+                            }
+                            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                                // 채널이 닫힘 (정상 종료)
+                                if !batch.is_empty() {
+                                    let _ = flush_batch(&mut batch, &db_pool).await;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// 배치를 DB에 쓰기 (async)
+/// 
+/// # Arguments
+/// * `batch` - DB 명령 배치
+/// * `db_pool` - 데이터베이스 연결 풀
+/// 
+/// # 처리 과정
+/// 1. 트랜잭션 시작
+/// 2. 각 명령 처리
+/// 3. 커밋
+async fn flush_batch(
+    batch: &mut Vec<super::db_commands::DbCommand>,
+    db_pool: &PgPool,
+) -> Result<()> {
+    use super::db_commands::DbCommand;
+    
+    if batch.is_empty() {
+        return Ok(());
+    }
+    
+    // 트랜잭션 시작
+    let mut tx = db_pool.begin().await
+        .context("Failed to begin transaction")?;
+    
+    // 배치 정렬: InsertOrder를 먼저 처리 (외래키 제약조건을 위해)
+    // 1. InsertOrder (주문 먼저 생성)
+    // 2. UpdateOrderStatus (주문 상태 업데이트)
+    // 3. InsertTrade (체결 내역 - 주문이 있어야 함)
+    // 4. UpdateBalance (잔고 업데이트)
+    batch.sort_by(|a, b| {
+        let priority = |cmd: &DbCommand| match cmd {
+            DbCommand::InsertOrder { .. } => 1,
+            DbCommand::UpdateOrderStatus { .. } => 2,
+            DbCommand::InsertTrade { .. } => 3,
+            DbCommand::UpdateBalance { .. } => 4,
+        };
+        priority(a).cmp(&priority(b))
+    });
+    
+    // 각 명령 처리
+    for cmd in batch.drain(..) {
+        match cmd {
+            DbCommand::InsertOrder {
+                order_id,
+                user_id,
+                order_type,
+                order_side,
+                base_mint,
+                quote_mint,
+                price,
+                amount,
+                created_at,
+            } => {
+                // ID 생성기로 생성한 ID를 사용 (auto increment 사용 안 함)
+                // order_id가 0이면 에러 (ID 생성기가 제대로 작동하지 않음)
+                if order_id == 0 {
+                    return Err(anyhow::anyhow!(
+                        "Order ID is 0. ID generator may not be initialized properly."
+                    ));
+                }
+                
+                // 지정된 ID로 INSERT
+                sqlx::query(
+                    r#"
+                    INSERT INTO orders (
+                        id, user_id, order_type, order_side, base_mint, quote_mint,
+                        price, amount, filled_amount, filled_quote_amount, status, created_at, updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    ON CONFLICT (id) DO UPDATE SET
+                        updated_at = $13
+                    "#
+                )
+                .bind(order_id as i64)
+                .bind(user_id as i64)
+                .bind(&order_type)
+                .bind(&order_side)
+                .bind(&base_mint)
+                .bind(&quote_mint)
+                .bind(&price)
+                .bind(&amount)
+                .bind(rust_decimal::Decimal::ZERO)  // filled_amount
+                .bind(rust_decimal::Decimal::ZERO)  // filled_quote_amount
+                .bind("pending")  // status
+                .bind(created_at)
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await
+                .context("Failed to insert order")?;
+            }
+            
+            DbCommand::UpdateOrderStatus {
+                order_id,
+                status,
+                filled_amount,
+                filled_quote_amount,
+            } => {
+                // 취소 시에는 filled_quote_amount를 변경하지 않음 (기존 값 유지)
+                if status == "cancelled" {
+                    sqlx::query(
+                        r#"
+                        UPDATE orders
+                        SET status = $1, filled_amount = $2, updated_at = $3
+                        WHERE id = $4
+                        "#
+                    )
+                    .bind(&status)
+                    .bind(&filled_amount)
+                    .bind(chrono::Utc::now())
+                    .bind(order_id as i64)
+                    .execute(&mut *tx)
+                    .await
+                    .context("Failed to update order status")?;
+                } else {
+                    sqlx::query(
+                        r#"
+                        UPDATE orders
+                        SET status = $1, filled_amount = $2, filled_quote_amount = $3, updated_at = $4
+                        WHERE id = $5
+                        "#
+                    )
+                    .bind(&status)
+                    .bind(&filled_amount)
+                    .bind(&filled_quote_amount)
+                    .bind(chrono::Utc::now())
+                    .bind(order_id as i64)
+                    .execute(&mut *tx)
+                    .await
+                    .context("Failed to update order status")?;
+                }
+            }
+            
+            DbCommand::InsertTrade {
+                trade_id,
+                buy_order_id,
+                sell_order_id,
+                buyer_id,
+                seller_id,
+                price,
+                amount,
+                base_mint,
+                quote_mint,
+                timestamp,
+            } => {
+                // buy_order_id, sell_order_id가 0이면 스킵 (주문이 아직 DB에 INSERT되지 않음)
+                if buy_order_id == 0 || sell_order_id == 0 {
+                    eprintln!(
+                        "[DB Writer] Skipping trade insert: buy_order_id={}, sell_order_id={} (orders not yet inserted)",
+                        buy_order_id, sell_order_id
+                    );
+                    continue;
+                }
+                
+                // ID 생성기로 생성한 trade_id 사용
+                sqlx::query(
+                    r#"
+                    INSERT INTO trades (
+                        id, buy_order_id, sell_order_id, buyer_id, seller_id,
+                        price, amount, base_mint, quote_mint, created_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ON CONFLICT (id) DO NOTHING
+                    "#
+                )
+                .bind(trade_id as i64)
+                .bind(buy_order_id as i64)
+                .bind(sell_order_id as i64)
+                .bind(buyer_id as i64)
+                .bind(seller_id as i64)
+                .bind(&price)
+                .bind(&amount)
+                .bind(&base_mint)
+                .bind(&quote_mint)
+                .bind(timestamp)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!(
+                    "Failed to insert trade: trade_id={}, buy_order_id={}, sell_order_id={}, buyer_id={}, seller_id={}",
+                    trade_id, buy_order_id, sell_order_id, buyer_id, seller_id
+                ))?;
+            }
+            
+            DbCommand::UpdateBalance {
+                user_id,
+                mint,
+                available_delta,
+                locked_delta,
+            } => {
+                use crate::shared::database::repositories::cex::UserBalanceRepository;
+                use crate::domains::cex::models::balance::UserBalanceUpdate;
+                
+                let balance_repo = UserBalanceRepository::new(db_pool.clone());
+                let update = UserBalanceUpdate {
+                    available_delta,
+                    locked_delta,
+                };
+                
+                balance_repo.update_balance(user_id, &mint, &update).await
+                    .context("Failed to update balance")?;
+            }
+        }
+    }
+    
+    // 트랜잭션 커밋
+    tx.commit().await
+        .context("Failed to commit transaction")?;
+    
+    Ok(())
+}
+

@@ -19,16 +19,18 @@ impl TradeRepository {
         let row = sqlx::query(
             r#"
             INSERT INTO trades (
-                buy_order_id, sell_order_id, base_mint, quote_mint,
-                price, amount, created_at
+                buy_order_id, sell_order_id, buyer_id, seller_id,
+                base_mint, quote_mint, price, amount, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, buy_order_id, sell_order_id, base_mint, quote_mint,
                       price, amount, created_at
             "#,
         )
         .bind(trade_create.buy_order_id as i64)
         .bind(trade_create.sell_order_id as i64)
+        .bind(trade_create.buyer_id as i64)
+        .bind(trade_create.seller_id as i64)
         .bind(&trade_create.base_mint)
         .bind(&trade_create.quote_mint)
         .bind(&trade_create.price)

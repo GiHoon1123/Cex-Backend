@@ -77,6 +77,14 @@ pub struct TradeCreate {
     /// 매도 주문 ID
     pub sell_order_id: u64,
 
+    /// Buyer user ID
+    /// 매수자 사용자 ID
+    pub buyer_id: u64,
+
+    /// Seller user ID
+    /// 매도자 사용자 ID
+    pub seller_id: u64,
+
     /// Base asset
     /// 기준 자산
     pub base_mint: String,

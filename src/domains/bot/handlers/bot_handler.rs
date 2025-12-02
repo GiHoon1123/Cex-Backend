@@ -103,45 +103,39 @@ pub async fn delete_bot_data(
             }))).into_response();
     }
     
-    // 2. 모든 봇의 주문 ID 목록 조회
-    let all_bot_order_ids: Vec<i64> = match sqlx::query_scalar(
-        "SELECT id FROM orders WHERE user_id = ANY($1)"
+    // 2. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
+    let deleted_trades = match sqlx::query(
+        "DELETE FROM trades WHERE buyer_id = ANY($1) AND seller_id = ANY($1) RETURNING id"
     )
     .bind(&bot_user_ids)
     .fetch_all(db.pool())
     .await
     {
-        Ok(ids) => ids,
+        Ok(rows) => rows,
         Err(e) => {
-            eprintln!("[Bot Handler] Failed to fetch bot orders: {}", e);
+            eprintln!("[Bot Handler] Failed to delete trades: {}", e);
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
         }
     };
     
-    // 3. 매수와 매도가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
-    let deleted_trades = if !all_bot_order_ids.is_empty() {
-        match sqlx::query(
-            "DELETE FROM trades WHERE buy_order_id = ANY($1) AND sell_order_id = ANY($1) RETURNING id"
-        )
-        .bind(&all_bot_order_ids)
-        .fetch_all(db.pool())
-        .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                eprintln!("[Bot Handler] Failed to delete trades: {}", e);
-                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
-            }
-        }
-    } else {
-        vec![]
-    };
-    
-    // 3. 봇의 주문 삭제
+    // 3. 일반 사용자가 참여한 trade에 참여한 봇 order는 보존하고, 나머지만 삭제
+    // 봇끼리만 거래한 trade에 참여한 order만 삭제
     let deleted_orders = match sqlx::query(
-        "DELETE FROM orders WHERE user_id = $1 RETURNING id"
+        r#"
+        DELETE FROM orders
+        WHERE user_id = $1
+        AND id NOT IN (
+            SELECT DISTINCT buy_order_id FROM trades
+            WHERE buyer_id != ALL($2) OR seller_id != ALL($2)
+            UNION
+            SELECT DISTINCT sell_order_id FROM trades
+            WHERE buyer_id != ALL($2) OR seller_id != ALL($2)
+        )
+        RETURNING id
+        "#
     )
     .bind(user_id as i64)
+    .bind(&bot_user_ids)
     .fetch_all(db.pool())
     .await
     {

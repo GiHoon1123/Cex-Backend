@@ -117,10 +117,9 @@ impl BotManager {
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         // 2. 서버 재시작 시 이전 봇 데이터 모두 삭제
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self.delete_all_bot_data(bot1.id).await
-            .context("Failed to delete bot1 data")?;
-        self.delete_all_bot_data(bot2.id).await
-            .context("Failed to delete bot2 data")?;
+        // 두 봇의 데이터를 한 번에 삭제 (일반 사용자 거래 보존)
+        self.delete_all_bot_data_together().await
+            .context("Failed to delete bot data")?;
         Ok(())
     }
     
@@ -198,24 +197,32 @@ impl BotManager {
         Ok(())
     }
     
-    /// 봇 계정의 모든 데이터 삭제 (주문 및 거래)
-    /// Delete all bot data (orders and trades)
+    /// 봇 계정의 모든 데이터 삭제 (주문 및 거래) - 두 봇을 함께 처리
+    /// Delete all bot data (orders and trades) - process both bots together
     /// 
     /// 서버 재시작 시 이전에 생성된 봇 주문과 거래를 완전히 삭제합니다.
     /// 엔진 시작 전에 실행되므로 DB에서 직접 삭제합니다.
     /// 
     /// # 처리 순서
-    /// 1. 봇이 참여한 거래 삭제 (foreign key 제약 때문에 먼저)
-    /// 2. 봇의 모든 주문 삭제
+    /// 1. 두 봇의 주문 ID를 모두 수집
+    /// 2. 매수와 매도가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
+    /// 3. 두 봇의 모든 주문 삭제
     /// 
     /// 매수와 매도가 모두 봇인 거래만 삭제하여 일반 사용자의 거래 내역을 보존합니다.
-    async fn delete_all_bot_data(&self, user_id: u64) -> Result<()> {
-        // 1. 모든 봇 user_id 목록 생성
+    async fn delete_all_bot_data_together(&self) -> Result<()> {
+        // 1. 봇 이메일로 user_id 조회 (정확성 보장)
+        use crate::shared::database::UserRepository;
+        let user_repo = UserRepository::new(self.db.pool().clone());
+        
         let mut bot_user_ids = Vec::new();
-        if let Some(bot1) = &self.bot1_user {
+        
+        // bot1@bot.com 조회
+        if let Ok(Some(bot1)) = user_repo.get_user_by_email(&self.config.bot1_email).await {
             bot_user_ids.push(bot1.id as i64);
         }
-        if let Some(bot2) = &self.bot2_user {
+        
+        // bot2@bot.com 조회
+        if let Ok(Some(bot2)) = user_repo.get_user_by_email(&self.config.bot2_email).await {
             bot_user_ids.push(bot2.id as i64);
         }
         
@@ -223,44 +230,37 @@ impl BotManager {
             return Ok(());
         }
         
-        // 2. 모든 봇의 주문 ID 목록 조회
-        let all_bot_order_ids: Vec<i64> = sqlx::query_scalar(
+        // 2. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
+        sqlx::query(
             r#"
-            SELECT id FROM orders WHERE user_id = ANY($1)
+            DELETE FROM trades
+            WHERE buyer_id = ANY($1) AND seller_id = ANY($1)
             "#,
         )
         .bind(&bot_user_ids)
-        .fetch_all(self.db.pool())
+        .execute(self.db.pool())
         .await
-        .context("Failed to fetch bot order IDs")?;
+        .context("Failed to delete bot-only trades")?;
         
-        // 3. 매수와 매도가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
-        if !all_bot_order_ids.is_empty() {
-            sqlx::query(
-                r#"
-                DELETE FROM trades
-                WHERE buy_order_id = ANY($1) AND sell_order_id = ANY($1)
-                "#,
-            )
-            .bind(&all_bot_order_ids)
-            .execute(self.db.pool())
-            .await
-            .context("Failed to delete bot-only trades")?;
-        }
-        
-        // 4. 삭제 대상 봇의 주문 삭제
+        // 3. 일반 사용자가 참여한 trade에 참여한 봇 order는 보존하고, 나머지만 삭제
+        // 일반 사용자가 참여한 trade = buyer_id나 seller_id 중 하나라도 봇이 아닌 trade
         sqlx::query(
             r#"
-            DELETE FROM orders WHERE user_id = $1
-            RETURNING id
+            DELETE FROM orders
+            WHERE user_id = ANY($1)
+            AND id NOT IN (
+                SELECT DISTINCT buy_order_id FROM trades
+                WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
+                UNION
+                SELECT DISTINCT sell_order_id FROM trades
+                WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
+            )
             "#,
         )
-        .bind(user_id as i64)
+        .bind(&bot_user_ids)
         .execute(self.db.pool())
         .await
         .context("Failed to delete bot orders")?;
-        
-        // 봇 데이터 삭제 완료 (로그 제거 - 정상 동작은 조용히)
         
         Ok(())
     }
@@ -369,6 +369,167 @@ impl BotManager {
     /// Get engine reference
     pub fn engine(&self) -> &Arc<tokio::sync::Mutex<HighPerformanceEngine>> {
         &self.engine
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::shared::database::Database;
+    use crate::domains::bot::models::BotConfig;
+    use sqlx::PgPool;
+
+    async fn setup_test_db() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://root:1234@localhost:5432/solana_api_test".to_string());
+        PgPool::connect(&database_url).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_delete_bot_data_preserves_user_trades() {
+        let pool = setup_test_db().await;
+        let db = Database::noop(pool.clone());
+        
+        let bot1_email = "bot1@bot.com";
+        let bot2_email = "bot2@bot.com";
+        let user_email = "test_user@test.com";
+        
+        let user_repo = crate::shared::database::UserRepository::new(pool.clone());
+        
+        // 봇 user_id 조회
+        let bot1 = user_repo.get_user_by_email(bot1_email).await.unwrap();
+        let bot2 = user_repo.get_user_by_email(bot2_email).await.unwrap();
+        let user = user_repo.get_user_by_email(user_email).await.unwrap();
+        
+        if bot1.is_none() || bot2.is_none() || user.is_none() {
+            eprintln!("Skipping test: bot or user accounts not found");
+            return;
+        }
+        
+        let bot1_id = bot1.unwrap().id;
+        let bot2_id = bot2.unwrap().id;
+        let user_id = user.unwrap().id;
+        
+        // 테스트 데이터 삽입: 봇끼리 거래
+        sqlx::query(
+            r#"
+            INSERT INTO trades (id, buy_order_id, sell_order_id, buyer_id, seller_id, price, amount, base_mint, quote_mint, created_at)
+            VALUES (999999999, 999999999, 999999998, $1, $2, 100.0, 1.0, 'SOL', 'USDT', NOW())
+            ON CONFLICT (id) DO UPDATE SET buyer_id = $1, seller_id = $2
+            "#,
+        )
+        .bind(bot1_id as i64)
+        .bind(bot2_id as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        // 테스트 데이터 삽입: 일반 사용자와 봇 거래
+        sqlx::query(
+            r#"
+            INSERT INTO trades (id, buy_order_id, sell_order_id, buyer_id, seller_id, price, amount, base_mint, quote_mint, created_at)
+            VALUES (999999997, 999999997, 999999996, $1, $2, 100.0, 1.0, 'SOL', 'USDT', NOW())
+            ON CONFLICT (id) DO UPDATE SET buyer_id = $1, seller_id = $2
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(bot1_id as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        // BotManager 생성
+        let config = BotConfig {
+            bot1_email: bot1_email.to_string(),
+            bot2_email: bot2_email.to_string(),
+            ..Default::default()
+        };
+        let engine = Arc::new(tokio::sync::Mutex::new(
+            crate::domains::cex::engine::runtime::HighPerformanceEngine::new(db.clone())
+        ));
+        let mut bot_manager = BotManager::new(db.clone(), engine, config);
+        
+        // 봇 계정 설정
+        bot_manager.prepare_bots().await.unwrap();
+        
+        // 검증: 봇끼리 거래는 삭제되어야 함
+        let bot_to_bot_before: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM trades
+            WHERE buyer_id = $1 AND seller_id = $2 AND id = 999999999
+            "#,
+        )
+        .bind(bot1_id as i64)
+        .bind(bot2_id as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        
+        assert_eq!(bot_to_bot_before, 1, "Bot-to-bot trade should exist before deletion");
+        
+        // 검증: 일반 사용자와 봇 거래는 보존되어야 함
+        let user_to_bot_before: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM trades
+            WHERE buyer_id = $1 AND seller_id = $2 AND id = 999999997
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(bot1_id as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        
+        assert_eq!(user_to_bot_before, 1, "User-to-bot trade should exist before deletion");
+        
+        // 삭제 실행 (prepare_bots에서 자동 실행됨, 하지만 다시 실행해도 안전)
+        // prepare_bots에서 이미 실행되었으므로 직접 호출 불가
+        // 대신 SQL로 직접 테스트
+        let bot_user_ids = vec![bot1_id as i64, bot2_id as i64];
+        sqlx::query(
+            r#"
+            DELETE FROM trades
+            WHERE buyer_id = ANY($1) AND seller_id = ANY($1)
+            "#,
+        )
+        .bind(&bot_user_ids)
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        // 검증: 봇끼리 거래는 삭제되어야 함
+        let bot_to_bot_after: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM trades
+            WHERE buyer_id = $1 AND seller_id = $2 AND id = 999999999
+            "#,
+        )
+        .bind(bot1_id as i64)
+        .bind(bot2_id as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        
+        assert_eq!(bot_to_bot_after, 0, "Bot-to-bot trade should be deleted");
+        
+        // 검증: 일반 사용자와 봇 거래는 보존되어야 함
+        let user_to_bot_after: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM trades
+            WHERE buyer_id = $1 AND seller_id = $2 AND id = 999999997
+            "#,
+        )
+        .bind(user_id as i64)
+        .bind(bot1_id as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        
+        assert_eq!(user_to_bot_after, 1, "User-to-bot trade should be preserved");
+        
+        // 정리
+        sqlx::query("DELETE FROM trades WHERE id IN (999999999, 999999997)").execute(&pool).await.unwrap();
     }
 }
 

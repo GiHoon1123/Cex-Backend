@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 use tokio::time::{interval, Duration};
-use crate::shared::database::Database;
+use crate::shared::database::{Database, UserRepository};
 
 /// 봇 데이터 정리 스케줄러
 /// Bot Data Cleanup Scheduler
@@ -82,59 +82,59 @@ impl BotCleanupScheduler {
     /// 매수와 매도가 모두 봇인 거래만 삭제하여 일반 사용자의 거래 내역을 보존합니다.
     async fn delete_bot_data_internal(
         db: &Database,
-        bot1_user_id: Option<u64>,
-        bot2_user_id: Option<u64>,
+        _bot1_user_id: Option<u64>,
+        _bot2_user_id: Option<u64>,
     ) -> Result<()> {
-        // 1. 봇 user_id 목록 생성
+        // 1. 봇 이메일로 user_id 조회 (정확성 보장)
+        let user_repo = UserRepository::new(db.pool().clone());
+        
         let mut bot_user_ids = Vec::new();
-        if let Some(id) = bot1_user_id {
-            bot_user_ids.push(id as i64);
+        
+        // bot1@bot.com 조회
+        if let Ok(Some(bot1)) = user_repo.get_user_by_email("bot1@bot.com").await {
+            bot_user_ids.push(bot1.id as i64);
         }
-        if let Some(id) = bot2_user_id {
-            bot_user_ids.push(id as i64);
+        
+        // bot2@bot.com 조회
+        if let Ok(Some(bot2)) = user_repo.get_user_by_email("bot2@bot.com").await {
+            bot_user_ids.push(bot2.id as i64);
         }
         
         if bot_user_ids.is_empty() {
             return Ok(());
         }
         
-        // 2. 모든 봇의 주문 ID 목록 조회
-        let all_bot_order_ids: Vec<i64> = sqlx::query_scalar(
+        // 2. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
+        sqlx::query(
             r#"
-            SELECT id FROM orders WHERE user_id = ANY($1)
+            DELETE FROM trades
+            WHERE buyer_id = ANY($1) AND seller_id = ANY($1)
             "#,
         )
         .bind(&bot_user_ids)
-        .fetch_all(db.pool())
+        .execute(db.pool())
         .await
-        .context("Failed to fetch bot order IDs")?;
+        .context("Failed to delete bot-only trades")?;
         
-        // 3. 매수와 매도가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
-        if !all_bot_order_ids.is_empty() {
-            sqlx::query(
-                r#"
-                DELETE FROM trades
-                WHERE buy_order_id = ANY($1) AND sell_order_id = ANY($1)
-                "#,
+        // 3. 일반 사용자가 참여한 trade에 참여한 봇 order는 보존하고, 나머지만 삭제
+        // 봇끼리만 거래한 trade에 참여한 order만 삭제
+        sqlx::query(
+            r#"
+            DELETE FROM orders
+            WHERE user_id = ANY($1)
+            AND id NOT IN (
+                SELECT DISTINCT buy_order_id FROM trades
+                WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
+                UNION
+                SELECT DISTINCT sell_order_id FROM trades
+                WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
             )
-            .bind(&all_bot_order_ids)
-            .execute(db.pool())
-            .await
-            .context("Failed to delete bot-only trades")?;
-        }
-        
-        // 4. 봇의 모든 주문 삭제
-        if !bot_user_ids.is_empty() {
-            sqlx::query(
-                r#"
-                DELETE FROM orders WHERE user_id = ANY($1)
-                "#,
-            )
-            .bind(&bot_user_ids)
-            .execute(db.pool())
-            .await
-            .context("Failed to delete bot orders")?;
-        }
+            "#,
+        )
+        .bind(&bot_user_ids)
+        .execute(db.pool())
+        .await
+        .context("Failed to delete bot orders")?;
         
         Ok(())
     }

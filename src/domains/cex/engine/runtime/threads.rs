@@ -454,23 +454,30 @@ pub(crate) fn process_submit_order(
     
     // 3-1. 주문을 DB에 저장 (배치로 처리됨, trade insert 전에 필요 - 외래키 제약)
     // 주문 ID는 DB Writer가 INSERT 시 auto increment로 생성됨
-    if let Some(tx) = db_tx {
-        let db_cmd = super::db_commands::DbCommand::InsertOrder {
-            order_id: order.id,  // 임시 ID (0), DB Writer가 실제 ID 생성
-            user_id: order.user_id,
-            order_type: order.order_type.clone(),
-            order_side: order.order_side.clone(),
-            base_mint: order.base_mint.clone(),
-            quote_mint: order.quote_mint.clone(),
-            price: order.price,
-            amount: order.amount,
-            created_at: order.created_at,
-        };
-        let _ = tx.send(db_cmd); // Non-blocking, 배치로 처리됨
+    // 시장가 주문은 처음에 InsertOrder를 보내지 않고, 모든 처리가 끝난 후 최종 상태로 한 번만 전송
+    let is_market_order = order.order_side == "market";
+    if !is_market_order {
+        // 지정가 주문만 처음에 InsertOrder 전송 (pending 상태)
+        if let Some(tx) = db_tx {
+            let db_cmd = super::db_commands::DbCommand::InsertOrder {
+                order_id: order.id,  // 임시 ID (0), DB Writer가 실제 ID 생성
+                user_id: order.user_id,
+                order_type: order.order_type.clone(),
+                order_side: order.order_side.clone(),
+                base_mint: order.base_mint.clone(),
+                quote_mint: order.quote_mint.clone(),
+                price: order.price,
+                amount: order.amount,
+                created_at: order.created_at,
+                status: None, // None이면 "pending"
+                filled_amount: None, // None이면 0
+                filled_quote_amount: None, // None이면 0
+            };
+            let _ = tx.send(db_cmd); // Non-blocking, 배치로 처리됨
+        }
     }
     
     // 4. 시장가 주문 여부 및 초기 잔고 잠금 정보 저장 (order 이동 전)
-    let is_market_order = order.order_side == "market";
     let initial_quote_amount = order.quote_amount;
     let initial_amount = order.amount;
     
@@ -652,7 +659,7 @@ pub(crate) fn process_submit_order(
                 }
             }
             
-            // 3. UpdateOrderStatus 명령 전송
+            // 3. 시장가 주문을 최종 상태로 InsertOrder 한 번만 전송
             let total_filled_amount: Decimal = matches.iter()
                 .map(|m| m.amount)
                 .sum();
@@ -660,21 +667,36 @@ pub(crate) fn process_submit_order(
                 .map(|m| m.price * m.amount)
                 .sum();
             
-            let db_cmd = super::db_commands::DbCommand::UpdateOrderStatus {
+            // 체결이 있으면 "filled", 없으면 "cancelled"
+            let final_status = if total_filled_amount > Decimal::ZERO {
+                "filled".to_string()
+            } else {
+                "cancelled".to_string()
+            };
+            
+            let db_cmd = super::db_commands::DbCommand::InsertOrder {
                 order_id: order_after_match.id,
-                status: "filled".to_string(),
-                filled_amount: total_filled_amount,
-                filled_quote_amount: total_filled_quote_amount,
+                user_id: order_after_match.user_id,
+                order_type: order_after_match.order_type.clone(),
+                order_side: order_after_match.order_side.clone(),
+                base_mint: order_after_match.base_mint.clone(),
+                quote_mint: order_after_match.quote_mint.clone(),
+                price: order_after_match.price,
+                amount: order_after_match.amount,
+                created_at: order_after_match.created_at,
+                status: Some(final_status),
+                filled_amount: Some(total_filled_amount),
+                filled_quote_amount: Some(total_filled_quote_amount),
             };
             if let Err(e) = tx.send(db_cmd) {
                 eprintln!(
-                    "[Order Submit] Failed to send UpdateOrderStatus command for market order {}: {}",
+                    "[Order Submit] Failed to send InsertOrder command for market order {}: {}",
                     order_after_match.id, e
                 );
             }
         }
         
-        // 시장가 주문은 항상 성공으로 처리 (IOC 방식)
+        // 시장가 주문 처리 완료 (IOC 방식: 체결되면 filled, 안 되면 cancelled)
         return Ok(matches);
     }
     
@@ -1360,6 +1382,24 @@ mod tests {
         }
     }
 
+    fn sample_market_buy(order_id: u64, user_id: u64, quote_amount: Decimal) -> OrderEntry {
+        OrderEntry {
+            id: order_id,
+            user_id,
+            order_type: "buy".to_string(),
+            order_side: "market".to_string(),
+            base_mint: "SOL".to_string(),
+            quote_mint: "USDT".to_string(),
+            price: None,
+            amount: Decimal::ZERO,
+            quote_amount: Some(quote_amount),
+            filled_amount: Decimal::ZERO,
+            remaining_amount: Decimal::ZERO,
+            remaining_quote_amount: Some(quote_amount),
+            created_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn submit_order_without_persistence_channels() {
         let orderbooks = Arc::new(RwLock::new(HashMap::new()));
@@ -1379,6 +1419,158 @@ mod tests {
 
         let books = orderbooks.read();
         assert_eq!(books.len(), 1);
+    }
+
+    #[test]
+    fn test_market_order_no_orderbook_sends_cancelled() {
+        // 시장가 주문이 오더북이 없을 때 cancelled 상태로 InsertOrder를 한 번만 보내는지 테스트
+        use crossbeam::channel;
+        
+        let orderbooks = Arc::new(RwLock::new(HashMap::new()));
+        let matcher = Arc::new(Matcher::new());
+        let executor = Arc::new(Mutex::new(Executor::new_without_wal()));
+        
+        // 잔고 설정 (available에 충분한 금액이 있어야 잠금 가능)
+        {
+            let mut exec = executor.lock();
+            exec.balance_cache_mut()
+                .set_balance(1, "USDT", Decimal::new(1000, 0), Decimal::ZERO); // 1000 USDT available
+        }
+        
+        // DB 명령 채널 생성
+        let (db_tx, db_rx) = channel::unbounded();
+        
+        // 시장가 매수 주문 (오더북에 매도 호가 없음)
+        let market_order = sample_market_buy(1, 1, Decimal::new(1000, 0));
+        
+        // 주문 제출
+        let result = super::process_submit_order(
+            market_order,
+            None,
+            Some(&db_tx),
+            &orderbooks,
+            &matcher,
+            &executor,
+        ).unwrap();
+        
+        // 매칭이 없어야 함
+        assert_eq!(result.len(), 0);
+        
+        // DB 명령 수집
+        let db_commands: Vec<_> = db_rx.try_iter().collect();
+        
+        // 시장가 주문은 InsertOrder를 한 번만 보내야 함 (cancelled 상태)
+        let insert_order_cmds: Vec<(Option<String>, Option<Decimal>)> = db_commands.iter()
+            .filter_map(|cmd| {
+                if let crate::domains::cex::engine::runtime::db_commands::DbCommand::InsertOrder { status, filled_amount, .. } = cmd {
+                    Some((status.clone(), *filled_amount))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // InsertOrder가 정확히 한 번만 전송되어야 함
+        assert_eq!(insert_order_cmds.len(), 1, "시장가 주문은 InsertOrder를 한 번만 보내야 함");
+        
+        // cancelled 상태로 전송되어야 함
+        let (status, filled_amount) = &insert_order_cmds[0];
+        assert_eq!(status.as_ref().unwrap(), "cancelled", "오더북이 없으면 cancelled 상태여야 함");
+        assert_eq!(*filled_amount.as_ref().unwrap(), Decimal::ZERO, "체결이 없으면 filled_amount는 0이어야 함");
+    }
+
+    #[test]
+    fn test_market_order_with_orderbook_sends_filled() {
+        // 시장가 주문이 오더북이 있을 때 filled 상태로 InsertOrder를 한 번만 보내는지 테스트
+        use crossbeam::channel;
+        use crate::domains::cex::engine::types::TradingPair;
+        
+        let orderbooks = Arc::new(RwLock::new(HashMap::new()));
+        let matcher = Arc::new(Matcher::new());
+        let executor = Arc::new(Mutex::new(Executor::new_without_wal()));
+        
+        // 잔고 설정 (available에 충분한 금액이 있어야 잠금 가능)
+        {
+            let mut exec = executor.lock();
+            exec.balance_cache_mut()
+                .set_balance(1, "USDT", Decimal::new(1000, 0), Decimal::ZERO); // 매수자: 1000 USDT available
+            exec.balance_cache_mut()
+                .set_balance(2, "SOL", Decimal::new(5, 0), Decimal::ZERO); // 매도자: 5 SOL available
+        }
+        
+        // 오더북에 매도 호가 추가
+        {
+            let mut books = orderbooks.write();
+            let pair = TradingPair::new("SOL".to_string(), "USDT".to_string());
+            let mut orderbook = crate::domains::cex::engine::orderbook::OrderBook::new(pair.clone());
+            
+            // 매도 주문 추가 (100 USDT에 2 SOL)
+            let sell_order = OrderEntry {
+                id: 2,
+                user_id: 2,
+                order_type: "sell".to_string(),
+                order_side: "limit".to_string(),
+                base_mint: "SOL".to_string(),
+                quote_mint: "USDT".to_string(),
+                price: Some(Decimal::new(100, 0)),
+                amount: Decimal::new(2, 0),
+                quote_amount: None,
+                filled_amount: Decimal::ZERO,
+                remaining_amount: Decimal::new(2, 0),
+                remaining_quote_amount: None,
+                created_at: Utc::now(),
+            };
+            orderbook.add_order(sell_order);
+            books.insert(pair, orderbook);
+        }
+        
+        // 매도 주문의 잔고 잠금
+        {
+            let mut exec = executor.lock();
+            exec.balance_cache_mut()
+                .set_balance(2, "SOL", Decimal::ZERO, Decimal::new(2, 0)); // 2 SOL locked
+        }
+        
+        // DB 명령 채널 생성
+        let (db_tx, db_rx) = channel::unbounded();
+        
+        // 시장가 매수 주문 (1000 USDT로 매수)
+        let market_order = sample_market_buy(1, 1, Decimal::new(1000, 0));
+        
+        // 주문 제출
+        let result = super::process_submit_order(
+            market_order,
+            None,
+            Some(&db_tx),
+            &orderbooks,
+            &matcher,
+            &executor,
+        ).unwrap();
+        
+        // 매칭이 있어야 함 (2 SOL 체결)
+        assert_eq!(result.len(), 1);
+        
+        // DB 명령 수집
+        let db_commands: Vec<_> = db_rx.try_iter().collect();
+        
+        // 시장가 주문은 InsertOrder를 한 번만 보내야 함 (filled 상태)
+        let insert_order_cmds: Vec<(Option<String>, Option<Decimal>)> = db_commands.iter()
+            .filter_map(|cmd| {
+                if let crate::domains::cex::engine::runtime::db_commands::DbCommand::InsertOrder { status, filled_amount, .. } = cmd {
+                    Some((status.clone(), *filled_amount))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // InsertOrder가 정확히 한 번만 전송되어야 함
+        assert_eq!(insert_order_cmds.len(), 1, "시장가 주문은 InsertOrder를 한 번만 보내야 함");
+        
+        // filled 상태로 전송되어야 함
+        let (status, filled_amount) = &insert_order_cmds[0];
+        assert_eq!(status.as_ref().unwrap(), "filled", "체결이 있으면 filled 상태여야 함");
+        assert!(*filled_amount.as_ref().unwrap() > Decimal::ZERO, "체결이 있으면 filled_amount는 0보다 커야 함");
     }
 }
 
@@ -1670,6 +1862,9 @@ async fn flush_batch(
                 price,
                 amount,
                 created_at,
+                status,
+                filled_amount,
+                filled_quote_amount,
             } => {
                 // ID 생성기로 생성한 ID를 사용 (auto increment 사용 안 함)
                 // order_id가 0이면 에러 (ID 생성기가 제대로 작동하지 않음)
@@ -1678,6 +1873,11 @@ async fn flush_batch(
                         "Order ID is 0. ID generator may not be initialized properly."
                     ));
                 }
+                
+                // 상태 및 체결 정보 (시장가 주문은 최종 상태로 전달됨)
+                let final_status = status.unwrap_or_else(|| "pending".to_string());
+                let final_filled_amount = filled_amount.unwrap_or(rust_decimal::Decimal::ZERO);
+                let final_filled_quote_amount = filled_quote_amount.unwrap_or(rust_decimal::Decimal::ZERO);
                 
                 // 지정된 ID로 INSERT
                 sqlx::query(
@@ -1699,9 +1899,9 @@ async fn flush_batch(
                 .bind(&quote_mint)
                 .bind(&price)
                 .bind(&amount)
-                .bind(rust_decimal::Decimal::ZERO)  // filled_amount
-                .bind(rust_decimal::Decimal::ZERO)  // filled_quote_amount
-                .bind("pending")  // status
+                .bind(final_filled_amount)
+                .bind(final_filled_quote_amount)
+                .bind(&final_status)
                 .bind(created_at)
                 .bind(created_at)
                 .execute(&mut *tx)

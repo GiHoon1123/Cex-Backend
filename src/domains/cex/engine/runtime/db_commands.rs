@@ -33,6 +33,9 @@ pub enum DbCommand {
     /// * `price` - 주문 가격 (지정가만)
     /// * `amount` - 주문 수량
     /// * `created_at` - 생성 시간
+    /// * `status` - 주문 상태 (None이면 "pending", 시장가 주문은 최종 상태로 전달)
+    /// * `filled_amount` - 체결된 수량 (None이면 0)
+    /// * `filled_quote_amount` - 체결된 금액 (None이면 0)
     InsertOrder {
         order_id: u64,
         user_id: u64,
@@ -43,6 +46,9 @@ pub enum DbCommand {
         price: Option<Decimal>,
         amount: Decimal,
         created_at: DateTime<Utc>,
+        status: Option<String>,
+        filled_amount: Option<Decimal>,
+        filled_quote_amount: Option<Decimal>,
     },
     
     /// 주문 상태 업데이트

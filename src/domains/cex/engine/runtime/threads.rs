@@ -519,6 +519,10 @@ pub(crate) fn process_submit_order(
         use chrono::Utc;
         use crate::shared::utils::id_generator::TradeIdGenerator;
         
+        // 디버깅: 매칭 결과 확인
+        eprintln!("[Market Order Debug] order_id={}, initial_matches={}, remaining_quote_amount={:?}, remaining_amount={}", 
+                 order_after_match.id, matches.len(), order_after_match.remaining_quote_amount, order_after_match.remaining_amount);
+        
         // 체결 처리 (성공한 매칭만 추적, DB 명령은 건너뛰기)
         let mut successful_matches = Vec::new();
         let mut total_quote_used = Decimal::ZERO;
@@ -548,6 +552,10 @@ pub(crate) fn process_submit_order(
                 }
             }
         }
+        
+        // 디버깅: 성공한 매칭 확인
+        eprintln!("[Market Order Debug] order_id={}, successful_matches={}, total_quote_used={}, total_amount_used={}", 
+                 order_after_match.id, successful_matches.len(), total_quote_used, total_amount_used);
         
         // 성공한 매칭만 사용하여 주문 상태 업데이트
         let matches = successful_matches;

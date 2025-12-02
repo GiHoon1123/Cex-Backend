@@ -62,13 +62,36 @@ impl PositionService {
         user_id: u64,
         mint: &str,
     ) -> Result<Option<AssetPosition>> {
-        // 1. 현재 잔고 조회 (엔진 메모리에서 실시간 조회)
+        // 1. 현재 잔고 조회 (엔진 메모리에서 실시간 조회, 없으면 DB에서 fallback)
+        // 주의: 엔진 lock을 잡은 상태에서 DB 조회를 하지 않도록 주의 (데드락 방지)
         let (available, locked) = {
-            let engine_guard = self.engine.lock().await;
-            engine_guard
-                .get_balance(user_id, mint)
-                .await
-                .context("Failed to get balance from engine")?
+            // 먼저 엔진 메모리에서 조회
+            let (engine_available, engine_locked) = {
+                let engine_guard = self.engine.lock().await;
+                engine_guard
+                    .get_balance(user_id, mint)
+                    .await
+                    .context("Failed to get balance from engine")?
+            };
+
+            // 엔진 메모리에 잔고가 있으면 엔진 값 사용
+            if engine_available > Decimal::ZERO || engine_locked > Decimal::ZERO {
+                (engine_available, engine_locked)
+            } else {
+                // 엔진 메모리에 잔고가 없으면 DB에서 조회 (fallback)
+                // 엔진 lock을 해제한 후 DB 조회 (데드락 방지)
+                let balance_repo = UserBalanceRepository::new(self.db.pool().clone());
+                if let Some(db_balance) = balance_repo
+                    .get_by_user_and_mint(user_id, mint)
+                    .await
+                    .context("Failed to fetch balance from database")?
+                {
+                    (db_balance.available, db_balance.locked)
+                } else {
+                    // DB에도 없으면 잔고 없음
+                    return Ok(None);
+                }
+            }
         };
 
         let current_balance = available + locked;
@@ -212,8 +235,8 @@ impl PositionService {
             .context("Failed to fetch user balance list from database")?;
 
         // 2. 각 자산별로 포지션 정보 계산
+        // 주의: get_position 내부에서 엔진 lock을 잡으므로 여기서는 lock을 잡지 않음 (데드락 방지)
         let mut positions = Vec::new();
-        let engine_guard = self.engine.lock().await;
 
         for db_balance in db_balances {
             // USDT는 포지션 계산 대상이 아님 (기준 통화)
@@ -221,17 +244,10 @@ impl PositionService {
                 continue;
             }
 
-            // 엔진 메모리에서 실시간 잔고 확인
-            let (available, locked) = engine_guard
-                .get_balance(user_id, &db_balance.mint_address)
-                .await
-                .unwrap_or((Decimal::ZERO, Decimal::ZERO)); // 실패 시 0으로 처리
-
             // 잔고가 있으면 포지션 정보 계산
-            if available + locked > Decimal::ZERO {
-                if let Some(position) = self.get_position(user_id, &db_balance.mint_address).await? {
-                    positions.push(position);
-                }
+            // get_position 내부에서 엔진 메모리와 DB를 모두 확인하므로 여기서는 바로 호출
+            if let Some(position) = self.get_position(user_id, &db_balance.mint_address).await? {
+                positions.push(position);
             }
         }
 

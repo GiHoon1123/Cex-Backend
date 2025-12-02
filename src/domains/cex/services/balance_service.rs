@@ -56,27 +56,38 @@ impl BalanceService {
             .await
             .context("Failed to fetch user balance list from database")?;
 
-        // 2. 각 자산마다 엔진 메모리에서 실시간 잔고 조회
+        // 2. 각 자산마다 엔진 메모리에서 실시간 잔고 조회 (없으면 DB 값 사용)
         let mut balances = Vec::new();
         let engine_guard = self.engine.lock().await;
 
         for db_balance in db_balances {
             // 엔진 메모리에서 실시간 잔고 조회
-            let (available, locked) = engine_guard
+            let (engine_available, engine_locked) = engine_guard
                 .get_balance(user_id, &db_balance.mint_address)
                 .await
                 .unwrap_or((Decimal::ZERO, Decimal::ZERO)); // 실패 시 0으로 처리
 
-            // 엔진 메모리 값으로 업데이트된 UserBalance 생성
-            balances.push(UserBalance {
-                id: db_balance.id,
-                user_id: db_balance.user_id,
-                mint_address: db_balance.mint_address,
-                available, // 엔진 메모리 값 사용
-                locked,    // 엔진 메모리 값 사용
-                created_at: db_balance.created_at,
-                updated_at: Utc::now(), // 실시간 조회이므로 현재 시간으로 업데이트
-            });
+            // 잔고 값 결정: 엔진 메모리에 잔고가 있으면 엔진 값 사용, 없으면 DB 값 사용 (fallback)
+            let (available, locked) = if engine_available > Decimal::ZERO || engine_locked > Decimal::ZERO {
+                // 엔진 메모리에 잔고가 있으면 엔진 값 사용 (실시간 정확성)
+                (engine_available, engine_locked)
+            } else {
+                // 엔진 메모리에 잔고가 없으면 DB 값 사용 (서버 재시작 후 등)
+                (db_balance.available, db_balance.locked)
+            };
+
+            // 잔고가 있으면 추가
+            if available > Decimal::ZERO || locked > Decimal::ZERO {
+                balances.push(UserBalance {
+                    id: db_balance.id,
+                    user_id: db_balance.user_id,
+                    mint_address: db_balance.mint_address,
+                    available, // 엔진 메모리 또는 DB 값 사용
+                    locked,    // 엔진 메모리 또는 DB 값 사용
+                    created_at: db_balance.created_at,
+                    updated_at: Utc::now(), // 실시간 조회이므로 현재 시간으로 업데이트
+                });
+            }
         }
 
         Ok(balances)
@@ -101,61 +112,66 @@ impl BalanceService {
         user_id: u64,
         mint_address: &str,
     ) -> Result<Option<UserBalance>> {
-        // 1. 엔진 메모리에서 실시간 잔고 조회
-        let (available, locked) = {
-            let engine_guard = self.engine.lock().await;
-            engine_guard
-                .get_balance(user_id, mint_address)
-                .await
-                .context("Failed to get balance from engine")?
-        };
+        // 1. 엔진 메모리에서 실시간 잔고 조회 (lock 없이 직접 호출)
+        let (engine_available, engine_locked) = self.engine
+            .lock()
+            .await
+            .get_balance(user_id, mint_address)
+            .await
+            .context("Failed to get balance from engine")?;
 
-        // 2. DB에서 메타데이터 조회 (id, created_at, updated_at)
+        // 2. DB에서 잔고 조회 (fallback용)
         let balance_repo = UserBalanceRepository::new(self.db.pool().clone());
         let db_balance = balance_repo
             .get_by_user_and_mint(user_id, mint_address)
             .await
             .context(format!(
-                "Failed to fetch balance metadata from database for user {} and asset {}",
+                "Failed to fetch balance from database for user {} and asset {}",
                 user_id, mint_address
             ))?;
 
-        // 3. 엔진 메모리 잔고가 0이고 DB에도 없으면 None 반환
-        if available == Decimal::ZERO && locked == Decimal::ZERO && db_balance.is_none() {
+        // 3. 엔진 메모리와 DB 모두 잔고가 없으면 None 반환
+        if (engine_available == Decimal::ZERO && engine_locked == Decimal::ZERO) && db_balance.is_none() {
             return Ok(None);
         }
 
-        // 4. UserBalance 생성 (엔진 메모리 값 사용, 메타데이터는 DB 값 사용)
+        // 4. 잔고 값 결정: 엔진 메모리에 잔고가 있으면 엔진 값 사용, 없으면 DB 값 사용 (fallback)
+        let (available, locked) = if engine_available > Decimal::ZERO || engine_locked > Decimal::ZERO {
+            // 엔진 메모리에 잔고가 있으면 엔진 값 사용 (실시간 정확성)
+            (engine_available, engine_locked)
+        } else if let Some(ref db_bal) = db_balance {
+            // 엔진 메모리에 잔고가 없으면 DB 값 사용 (서버 재시작 후 등)
+            (db_bal.available, db_bal.locked)
+        } else {
+            // 둘 다 없으면 None 반환
+            return Ok(None);
+        };
+
+        // 5. UserBalance 생성
         let balance = if let Some(db_bal) = db_balance {
-            // DB에 레코드가 있으면 엔진 메모리 값으로 업데이트
+            // DB에 레코드가 있으면 엔진/DB 값 사용, 메타데이터는 DB 값 사용
             Some(UserBalance {
                 id: db_bal.id,
                 user_id: db_bal.user_id,
                 mint_address: db_bal.mint_address,
-                available, // 엔진 메모리 값 사용
-                locked,    // 엔진 메모리 값 사용
+                available, // 엔진 메모리 또는 DB 값 사용
+                locked,    // 엔진 메모리 또는 DB 값 사용
                 created_at: db_bal.created_at,
                 updated_at: Utc::now(), // 실시간 조회이므로 현재 시간으로 업데이트
             })
         } else {
-            // DB에 레코드가 없으면 엔진 메모리 값만 사용 (임시 레코드 생성)
-            // 실제로는 DB에 레코드가 있어야 하지만, 엔진 메모리에만 있는 경우를 대비
-            if available > Decimal::ZERO || locked > Decimal::ZERO {
-                // 엔진 메모리에 잔고가 있으면 DB에 레코드 생성
-                let balance_create = UserBalanceCreate {
-                    user_id,
-                    mint_address: mint_address.to_string(),
-                    available,
-                    locked,
-                };
-                let new_balance = balance_repo
-                    .create_or_get(&balance_create)
-                    .await
-                    .context("Failed to create balance record in database")?;
-                Some(new_balance)
-            } else {
-                None
-            }
+            // DB에 레코드가 없으면 엔진 메모리 값으로 DB 레코드 생성
+            let balance_create = UserBalanceCreate {
+                user_id,
+                mint_address: mint_address.to_string(),
+                available,
+                locked,
+            };
+            let new_balance = balance_repo
+                .create_or_get(&balance_create)
+                .await
+                .context("Failed to create balance record in database")?;
+            Some(new_balance)
         };
 
         Ok(balance)

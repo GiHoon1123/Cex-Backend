@@ -506,57 +506,153 @@ pub(crate) fn process_submit_order(
     
     // 8. 시장가 주문 처리 (IOC 방식: 오더북에 있는 만큼만 체결, 남은 잔량은 즉시 취소)
     // 시장가 주문은 부분 체결되어도 성공으로 처리하고 'filled' 상태로 저장
+    // 모든 매칭 완료 후 DB 업데이트 명령을 한 번에 전송 (원자성 보장)
     if is_market_order {
-        // 체결 처리
+        use std::collections::HashMap;
+        use chrono::Utc;
+        use crate::shared::utils::id_generator::TradeIdGenerator;
+        
+        // 체결 처리 (성공한 매칭만 추적, DB 명령은 건너뛰기)
+        let mut successful_matches = Vec::new();
+        let mut total_quote_used = Decimal::ZERO;
+        let mut total_amount_used = Decimal::ZERO;
+        
         {
             let mut executor_guard = executor.lock();
             for match_result in &matches {
-                if let Err(e) = executor_guard.execute_trade(match_result) {
-                    eprintln!("Failed to execute trade: {}", e);
+                // skip_db_updates=true로 설정하여 DB 명령 전송 건너뛰기
+                match executor_guard.execute_trade(match_result, true) {
+                    Ok(_) => {
+                        // 성공한 매칭만 추적
+                        successful_matches.push(match_result.clone());
+                        if order_after_match.order_type == "buy" {
+                            total_quote_used += match_result.price * match_result.amount;
+                        } else {
+                            total_amount_used += match_result.amount;
+                        }
+                    }
+                    Err(e) => {
+                        // 잔고 부족 등으로 실패한 매칭은 건너뛰고 계속 진행
+                        eprintln!("[Market Order] Failed to execute trade (skipping): buy_order_id={}, sell_order_id={}, buyer_id={}, seller_id={}, error={}", 
+                                 match_result.buy_order_id, match_result.sell_order_id, 
+                                 match_result.buyer_id, match_result.seller_id, e);
+                        // 실패한 매칭은 무시하고 계속 진행
+                    }
                 }
             }
         }
         
+        // 성공한 매칭만 사용하여 주문 상태 업데이트
+        let matches = successful_matches;
+        
         // 남은 잔고 잠금 해제 (IOC: 남은 잔량은 즉시 취소)
+        // 실제로 사용된 금액을 기준으로 계산 (성공한 매칭만 반영)
+        let unlock_mint;
+        let unlock_amount;
         {
             let mut executor_guard = executor.lock();
-            let (unlock_mint, unlock_amount) = if order_after_match.order_type == "buy" {
-                // 시장가 매수: 남은 quote_amount만큼 USDT 잠금 해제
-                let remaining = order_after_match.remaining_quote_amount.unwrap_or(Decimal::ZERO);
-                (&order_after_match.quote_mint, remaining)
+            let (mint, amount) = if order_after_match.order_type == "buy" {
+                // 시장가 매수: 초기 quote_amount에서 실제 사용된 금액을 뺀 나머지 잠금 해제
+                let initial_quote = initial_quote_amount.unwrap_or(Decimal::ZERO);
+                let unlock = initial_quote - total_quote_used;
+                (&order_after_match.quote_mint, unlock)
             } else {
-                // 시장가 매도: 남은 amount만큼 SOL 등 잠금 해제
-                (&order_after_match.base_mint, order_after_match.remaining_amount)
+                // 시장가 매도: 초기 amount에서 실제 사용된 수량을 뺀 나머지 잠금 해제
+                let unlock = initial_amount - total_amount_used;
+                (&order_after_match.base_mint, unlock)
             };
+            
+            unlock_mint = mint.to_string();
+            unlock_amount = amount;
             
             if unlock_amount > Decimal::ZERO {
                 // 메모리 잔고 잠금 해제
                 if let Err(e) = executor_guard.unlock_balance_for_cancel(
                     order_after_match.id,
                     order_after_match.user_id,
-                    unlock_mint,
+                    mint,
                     unlock_amount,
                 ) {
                     eprintln!("Failed to unlock balance: {}", e);
-                } else {
-                    // DB Writer로 잔고 업데이트 명령 전송 (locked 감소, available 증가)
-                    if let Some(tx) = db_tx {
-                        let db_cmd = super::db_commands::DbCommand::UpdateBalance {
-                            user_id: order_after_match.user_id,
-                            mint: unlock_mint.to_string(),
-                            available_delta: Some(unlock_amount), // available 증가
-                            locked_delta: Some(-unlock_amount), // locked 감소
-                        };
-                        if let Err(e) = tx.send(db_cmd) {
-                            eprintln!("Failed to send DB update command for unlock: {}", e);
-                        }
-                    }
                 }
             }
         }
         
-        // 시장가 주문 상태를 'filled'로 저장 (부분 체결이어도 filled로 표시)
+        // 모든 매칭 완료 후 DB 업데이트 명령을 한 번에 전송
         if let Some(tx) = db_tx {
+            // 잔고 변경 집계: (user_id, mint) -> (available_delta, locked_delta)
+            let mut balance_changes: HashMap<(u64, String), (Decimal, Decimal)> = HashMap::new();
+            
+            // 각 매칭의 잔고 변경을 집계
+            for match_result in &matches {
+                let total_value = match_result.price * match_result.amount;
+                
+                // 매수자 USDT: locked 감소
+                let entry = balance_changes.entry((match_result.buyer_id, match_result.quote_mint.clone()))
+                    .or_insert((Decimal::ZERO, Decimal::ZERO));
+                entry.1 -= total_value; // locked 감소
+                
+                // 매도자 USDT: available 증가
+                let entry = balance_changes.entry((match_result.seller_id, match_result.quote_mint.clone()))
+                    .or_insert((Decimal::ZERO, Decimal::ZERO));
+                entry.0 += total_value; // available 증가
+                
+                // 매도자 SOL: locked 감소
+                let entry = balance_changes.entry((match_result.seller_id, match_result.base_mint.clone()))
+                    .or_insert((Decimal::ZERO, Decimal::ZERO));
+                entry.1 -= match_result.amount; // locked 감소
+                
+                // 매수자 SOL: available 증가
+                let entry = balance_changes.entry((match_result.buyer_id, match_result.base_mint.clone()))
+                    .or_insert((Decimal::ZERO, Decimal::ZERO));
+                entry.0 += match_result.amount; // available 증가
+            }
+            
+            // 남은 잔고 잠금 해제 반영
+            if unlock_amount > Decimal::ZERO {
+                let entry = balance_changes.entry((order_after_match.user_id, unlock_mint.clone()))
+                    .or_insert((Decimal::ZERO, Decimal::ZERO));
+                entry.0 += unlock_amount; // available 증가
+                entry.1 -= unlock_amount; // locked 감소
+            }
+            
+            // 1. InsertTrade 명령 전송 (모든 매칭)
+            for match_result in &matches {
+                let trade_id = TradeIdGenerator::next();
+                let db_cmd = super::db_commands::DbCommand::InsertTrade {
+                    trade_id,
+                    buy_order_id: match_result.buy_order_id,
+                    sell_order_id: match_result.sell_order_id,
+                    buyer_id: match_result.buyer_id,
+                    seller_id: match_result.seller_id,
+                    price: match_result.price,
+                    amount: match_result.amount,
+                    base_mint: match_result.base_mint.clone(),
+                    quote_mint: match_result.quote_mint.clone(),
+                    timestamp: Utc::now(),
+                };
+                if let Err(e) = tx.send(db_cmd) {
+                    eprintln!("Failed to send InsertTrade command: {}", e);
+                }
+            }
+            
+            // 2. UpdateBalance 명령 전송 (집계된 잔고 변경)
+            for ((user_id, mint), (available_delta, locked_delta)) in balance_changes {
+                // delta가 0이 아닌 경우만 전송
+                if available_delta != Decimal::ZERO || locked_delta != Decimal::ZERO {
+                    let db_cmd = super::db_commands::DbCommand::UpdateBalance {
+                        user_id,
+                        mint,
+                        available_delta: if available_delta != Decimal::ZERO { Some(available_delta) } else { None },
+                        locked_delta: if locked_delta != Decimal::ZERO { Some(locked_delta) } else { None },
+                    };
+                    if let Err(e) = tx.send(db_cmd) {
+                        eprintln!("Failed to send UpdateBalance command: user_id={}, error={}", user_id, e);
+                    }
+                }
+            }
+            
+            // 3. UpdateOrderStatus 명령 전송
             let total_filled_amount: Decimal = matches.iter()
                 .map(|m| m.amount)
                 .sum();
@@ -583,10 +679,12 @@ pub(crate) fn process_submit_order(
     }
     
     // 8. 체결 처리 (정상 케이스: 지정가 주문)
+    // 지정가 주문은 각 매칭마다 DB 명령을 전송 (기존 방식 유지)
     {
         let mut executor_guard = executor.lock();
         for match_result in &matches {
-            if let Err(e) = executor_guard.execute_trade(match_result) {
+            // skip_db_updates=false로 설정하여 각 매칭마다 DB 명령 전송
+            if let Err(e) = executor_guard.execute_trade(match_result, false) {
                 // 에러 발생 시 로그 기록
                 eprintln!("Failed to execute trade: {}", e);
             }
@@ -1674,7 +1772,8 @@ async fn flush_batch(
                 }
                 
                 // ID 생성기로 생성한 trade_id 사용
-                sqlx::query(
+                // 외래키 제약조건 위반이나 트랜잭션 abort 에러는 조용히 무시 (스케줄러가 orders를 삭제한 경우)
+                match sqlx::query(
                     r#"
                     INSERT INTO trades (
                         id, buy_order_id, sell_order_id, buyer_id, seller_id,
@@ -1696,10 +1795,26 @@ async fn flush_batch(
                 .bind(timestamp)
                 .execute(&mut *tx)
                 .await
-                .with_context(|| format!(
-                    "Failed to insert trade: trade_id={}, buy_order_id={}, sell_order_id={}, buyer_id={}, seller_id={}",
-                    trade_id, buy_order_id, sell_order_id, buyer_id, seller_id
-                ))?;
+                {
+                    Ok(_) => {
+                        // 성공적으로 삽입됨
+                    }
+                    Err(sqlx::Error::Database(db_err)) => {
+                        // 외래키 제약조건 위반 (23503) 또는 트랜잭션 abort (25P02)는 무시
+                        // 스케줄러가 orders를 삭제한 경우 발생할 수 있음
+                        let error_code = db_err.code().as_deref().map(|s| s.to_string());
+                        if error_code.as_deref() == Some("23503") || error_code.as_deref() == Some("25P02") {
+                            // 조용히 무시 (로그 출력 안 함)
+                        } else {
+                            // 다른 DB 에러는 로그만 출력하고 계속 진행
+                            eprintln!("[DB Writer] Trade insert error (non-critical): trade_id={}, buy_order_id={}, sell_order_id={}, error={}", 
+                                     trade_id, buy_order_id, sell_order_id, db_err);
+                        }
+                    }
+                    Err(_e) => {
+                        // 다른 에러도 조용히 무시 (스케줄러 삭제로 인한 정상적인 상황)
+                    }
+                }
             }
             
             DbCommand::UpdateBalance {

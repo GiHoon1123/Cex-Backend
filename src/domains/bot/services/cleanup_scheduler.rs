@@ -42,7 +42,7 @@ impl BotCleanupScheduler {
             db,
             bot1_user_id,
             bot2_user_id,
-            enabled: Arc::new(AtomicBool::new(true)), // 기본값: 활성화
+            enabled: Arc::new(AtomicBool::new(false)), // 기본값: 비활성화
         }
     }
     

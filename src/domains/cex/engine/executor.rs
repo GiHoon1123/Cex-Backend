@@ -112,6 +112,7 @@ impl Executor {
     /// 
     /// # Arguments
     /// * `match_result` - Matcher가 생성한 매칭 결과
+    /// * `skip_db_updates` - DB 업데이트 명령 전송을 건너뛸지 여부 (시장가 주문의 경우 true)
     /// 
     /// # Returns
     /// ExecutionResult - 실행 결과
@@ -121,6 +122,7 @@ impl Executor {
     /// 2. 잔고 확인 (locked 확인)
     /// 3. 잔고 이체 (locked → available)
     /// 4. WAL에 잔고 업데이트 메시지 발행
+    /// 5. DB 업데이트 명령 전송 (skip_db_updates가 false인 경우만)
     /// 
     /// # 안전성
     /// - WAL 메시지를 먼저 발행하므로 WAL Thread가 디스크에 기록
@@ -130,7 +132,7 @@ impl Executor {
     /// - Channel send: ~100ns (디스크 대기 없음!)
     /// - WAL Thread가 비동기로 디스크 쓰기
     /// - Engine은 즉시 다음 작업 진행
-    pub fn execute_trade(&mut self, match_result: &MatchResult) -> Result<ExecutionResult> {
+    pub fn execute_trade(&mut self, match_result: &MatchResult, skip_db_updates: bool) -> Result<ExecutionResult> {
         // ============================================
         // Step 1: WAL 메시지 발행 (가장 먼저!)
         // ============================================
@@ -182,70 +184,73 @@ impl Executor {
         // ============================================
         // Step 3: DB Writer 채널로 체결 내역 전송 (실시간)
         // ============================================
-        // trade_id는 ID 생성기로 생성
-        use crate::shared::utils::id_generator::TradeIdGenerator;
-        let trade_id = TradeIdGenerator::next();
-        
-        if let Some(sender) = &self.db_sender {
-            let cmd = DbCommand::InsertTrade {
-                trade_id,
-                buy_order_id: match_result.buy_order_id,
-                sell_order_id: match_result.sell_order_id,
-                buyer_id: match_result.buyer_id,
-                seller_id: match_result.seller_id,
-                price: match_result.price,
-                amount: match_result.amount,
-                base_mint: match_result.base_mint.clone(),
-                quote_mint: match_result.quote_mint.clone(),
-                timestamp: Utc::now(),
-            };
-            let _ = sender.send(cmd);  // Non-blocking (~100ns)
-        }
-        
-        // ============================================
-        // Step 4: WAL에 잔고 업데이트 메시지 발행 및 DB Writer로 잔고 업데이트 명령 전송
-        // ============================================
-        
-        // 계산: 총 거래 금액 (이미 위에서 계산했지만 재사용)
-        let total_value = match_result.price * match_result.amount;
-        
-        // 매수자: USDT 차감 (locked에서 차감됨)
-        // 매도자: USDT 증가 (available에 추가됨)
-        // 매도자: SOL 차감 (locked에서 차감됨)
-        // 매수자: SOL 증가 (available에 추가됨)
-        
-        if let Some(db_sender) = &self.db_sender {
-            // 매수자 USDT 잔고 업데이트 (locked에서 차감됨)
-            let _ = db_sender.send(DbCommand::UpdateBalance {
-                user_id: match_result.buyer_id,
-                mint: match_result.quote_mint.clone(),
-                available_delta: None, // available은 변경 없음 (locked에서 차감)
-                locked_delta: Some(-total_value), // locked에서 차감
-            });
+        // skip_db_updates가 true인 경우 DB 명령 전송 건너뛰기 (시장가 주문의 경우)
+        if !skip_db_updates {
+            // trade_id는 ID 생성기로 생성
+            use crate::shared::utils::id_generator::TradeIdGenerator;
+            let trade_id = TradeIdGenerator::next();
             
-            // 매도자 USDT 잔고 업데이트 (available에 추가됨)
-            let _ = db_sender.send(DbCommand::UpdateBalance {
-                user_id: match_result.seller_id,
-                mint: match_result.quote_mint.clone(),
-                available_delta: Some(total_value), // available에 추가
-                locked_delta: None, // locked는 변경 없음
-            });
+            if let Some(sender) = &self.db_sender {
+                let cmd = DbCommand::InsertTrade {
+                    trade_id,
+                    buy_order_id: match_result.buy_order_id,
+                    sell_order_id: match_result.sell_order_id,
+                    buyer_id: match_result.buyer_id,
+                    seller_id: match_result.seller_id,
+                    price: match_result.price,
+                    amount: match_result.amount,
+                    base_mint: match_result.base_mint.clone(),
+                    quote_mint: match_result.quote_mint.clone(),
+                    timestamp: Utc::now(),
+                };
+                let _ = sender.send(cmd);  // Non-blocking (~100ns)
+            }
             
-            // 매도자 기준 자산 잔고 업데이트 (locked에서 차감됨)
-            let _ = db_sender.send(DbCommand::UpdateBalance {
-                user_id: match_result.seller_id,
-                mint: match_result.base_mint.clone(),
-                available_delta: None, // available은 변경 없음 (locked에서 차감)
-                locked_delta: Some(-match_result.amount), // locked에서 차감
-            });
+            // ============================================
+            // Step 4: WAL에 잔고 업데이트 메시지 발행 및 DB Writer로 잔고 업데이트 명령 전송
+            // ============================================
             
-            // 매수자 기준 자산 잔고 업데이트 (available에 추가됨)
-            let _ = db_sender.send(DbCommand::UpdateBalance {
-                user_id: match_result.buyer_id,
-                mint: match_result.base_mint.clone(),
-                available_delta: Some(match_result.amount), // available에 추가
-                locked_delta: None, // locked는 변경 없음
-            });
+            // 계산: 총 거래 금액 (이미 위에서 계산했지만 재사용)
+            let total_value = match_result.price * match_result.amount;
+            
+            // 매수자: USDT 차감 (locked에서 차감됨)
+            // 매도자: USDT 증가 (available에 추가됨)
+            // 매도자: SOL 차감 (locked에서 차감됨)
+            // 매수자: SOL 증가 (available에 추가됨)
+            
+            if let Some(db_sender) = &self.db_sender {
+                // 매수자 USDT 잔고 업데이트 (locked에서 차감됨)
+                let _ = db_sender.send(DbCommand::UpdateBalance {
+                    user_id: match_result.buyer_id,
+                    mint: match_result.quote_mint.clone(),
+                    available_delta: None, // available은 변경 없음 (locked에서 차감)
+                    locked_delta: Some(-total_value), // locked에서 차감
+                });
+                
+                // 매도자 USDT 잔고 업데이트 (available에 추가됨)
+                let _ = db_sender.send(DbCommand::UpdateBalance {
+                    user_id: match_result.seller_id,
+                    mint: match_result.quote_mint.clone(),
+                    available_delta: Some(total_value), // available에 추가
+                    locked_delta: None, // locked는 변경 없음
+                });
+                
+                // 매도자 기준 자산 잔고 업데이트 (locked에서 차감됨)
+                let _ = db_sender.send(DbCommand::UpdateBalance {
+                    user_id: match_result.seller_id,
+                    mint: match_result.base_mint.clone(),
+                    available_delta: None, // available은 변경 없음 (locked에서 차감)
+                    locked_delta: Some(-match_result.amount), // locked에서 차감
+                });
+                
+                // 매수자 기준 자산 잔고 업데이트 (available에 추가됨)
+                let _ = db_sender.send(DbCommand::UpdateBalance {
+                    user_id: match_result.buyer_id,
+                    mint: match_result.base_mint.clone(),
+                    available_delta: Some(match_result.amount), // available에 추가
+                    locked_delta: None, // locked는 변경 없음
+                });
+            }
         }
         
         // WAL에도 기록 (복구용)
@@ -394,25 +399,26 @@ mod tests {
     use rust_decimal::Decimal;
     
     #[test]
-    fn test_executor_execute_trade() {
+    fn test_executor_execute_trade_with_db_updates() {
+        // 지정가 주문 시나리오: skip_db_updates=false (각 매칭마다 DB 명령 전송)
         // WAL 없이 테스트
         let mut executor = Executor::new_without_wal();
         
         // 초기 잔고 설정
-        // 매수자 (user 100): 1000 USDT
+        // 매수자 (user 100): 1000 USDT locked (주문에 사용 중)
         executor.balance_cache_mut().set_balance(
             100,
             "USDT",
             Decimal::ZERO,
-            Decimal::from(1000), // locked (주문에 사용 중)
+            Decimal::from(1000),
         );
         
-        // 매도자 (user 200): 10 SOL
+        // 매도자 (user 200): 10 SOL locked (주문에 사용 중)
         executor.balance_cache_mut().set_balance(
             200,
             "SOL",
             Decimal::ZERO,
-            Decimal::from(10), // locked (주문에 사용 중)
+            Decimal::from(10),
         );
         
         // MatchResult 생성: 1 SOL @ 100 USDT
@@ -427,11 +433,67 @@ mod tests {
             quote_mint: "USDT".to_string(),
         };
         
-        // 체결 실행
-        let result = executor.execute_trade(&match_result);
+        // 체결 실행 (skip_db_updates=false: 지정가 주문은 각 매칭마다 DB 명령 전송)
+        let result = executor.execute_trade(&match_result, false);
         assert!(result.is_ok());
         
         // 잔고 확인
+        // 매수자: USDT 100 차감 (locked), SOL 1 증가 (available)
+        let buyer_usdt = executor.balance_cache().get_balance(100, "USDT").unwrap();
+        assert_eq!(buyer_usdt.locked, Decimal::from(900)); // 1000 - 100
+        assert_eq!(buyer_usdt.available, Decimal::ZERO);
+        
+        let buyer_sol = executor.balance_cache().get_balance(100, "SOL").unwrap();
+        assert_eq!(buyer_sol.available, Decimal::from(1)); // +1 SOL
+        
+        // 매도자: SOL 1 차감 (locked), USDT 100 증가 (available)
+        let seller_sol = executor.balance_cache().get_balance(200, "SOL").unwrap();
+        assert_eq!(seller_sol.locked, Decimal::from(9)); // 10 - 1
+        
+        let seller_usdt = executor.balance_cache().get_balance(200, "USDT").unwrap();
+        assert_eq!(seller_usdt.available, Decimal::from(100)); // +100 USDT
+    }
+    
+    #[test]
+    fn test_executor_execute_trade_skip_db_updates() {
+        // 시장가 주문 시나리오: skip_db_updates=true (모든 매칭 완료 후 한 번에 DB 명령 전송)
+        // WAL 없이 테스트
+        let mut executor = Executor::new_without_wal();
+        
+        // 초기 잔고 설정
+        // 매수자 (user 100): 1000 USDT locked (주문에 사용 중)
+        executor.balance_cache_mut().set_balance(
+            100,
+            "USDT",
+            Decimal::ZERO,
+            Decimal::from(1000),
+        );
+        
+        // 매도자 (user 200): 10 SOL locked (주문에 사용 중)
+        executor.balance_cache_mut().set_balance(
+            200,
+            "SOL",
+            Decimal::ZERO,
+            Decimal::from(10),
+        );
+        
+        // MatchResult 생성: 1 SOL @ 100 USDT
+        let match_result = MatchResult {
+            buy_order_id: 1,
+            sell_order_id: 2,
+            buyer_id: 100,
+            seller_id: 200,
+            price: Decimal::from(100),  // 100 USDT
+            amount: Decimal::from(1),   // 1 SOL
+            base_mint: "SOL".to_string(),
+            quote_mint: "USDT".to_string(),
+        };
+        
+        // 체결 실행 (skip_db_updates=true: 시장가 주문은 모든 매칭 완료 후 한 번에 DB 명령 전송)
+        let result = executor.execute_trade(&match_result, true);
+        assert!(result.is_ok());
+        
+        // 잔고 확인 (메모리 업데이트는 정상적으로 수행되어야 함)
         // 매수자: USDT 100 차감 (locked), SOL 1 증가 (available)
         let buyer_usdt = executor.balance_cache().get_balance(100, "USDT").unwrap();
         assert_eq!(buyer_usdt.locked, Decimal::from(900)); // 1000 - 100
@@ -484,9 +546,10 @@ mod tests {
     
     #[test]
     fn test_executor_insufficient_balance() {
+        // 잔고 부족 시나리오 테스트
         let mut executor = Executor::new_without_wal();
         
-        // 초기 잔고: 50 USDT locked (부족!)
+        // 초기 잔고: 50 USDT locked (부족! 100 USDT 필요)
         executor.balance_cache_mut().set_balance(100, "USDT", Decimal::ZERO, Decimal::from(50));
         
         // 매도자도 부족
@@ -504,14 +567,18 @@ mod tests {
             quote_mint: "USDT".to_string(),
         };
         
-        // 체결 실행 (실패해야 함)
-        let result = executor.execute_trade(&match_result);
+        // 체결 실행 (실패해야 함) - skip_db_updates 값과 관계없이 잔고 부족으로 실패
+        let result = executor.execute_trade(&match_result, false);
         assert!(result.is_err()); // 잔고 부족으로 에러
+        
+        // skip_db_updates=true인 경우도 동일하게 실패해야 함
+        let result2 = executor.execute_trade(&match_result, true);
+        assert!(result2.is_err()); // 잔고 부족으로 에러
     }
     
     #[test]
-    fn test_executor_multiple_trades() {
-        // 여러 체결 처리 테스트
+    fn test_executor_multiple_trades_with_db_updates() {
+        // 여러 체결 처리 테스트 (지정가 주문 시나리오: skip_db_updates=false)
         let mut executor = Executor::new_without_wal();
         
         // 초기 잔고
@@ -530,7 +597,8 @@ mod tests {
             quote_mint: "USDT".to_string(),
         };
         
-        executor.execute_trade(&match1).unwrap();
+        // 지정가 주문: 각 매칭마다 DB 명령 전송
+        executor.execute_trade(&match1, false).unwrap();
         
         // 두 번째 체결: 0.5 SOL @ 100 USDT
         let match2 = MatchResult {
@@ -544,9 +612,64 @@ mod tests {
             quote_mint: "USDT".to_string(),
         };
         
-        executor.execute_trade(&match2).unwrap();
+        executor.execute_trade(&match2, false).unwrap();
         
         // 최종 잔고 확인
+        // 매수자: 1000 USDT → 850 USDT, 0 SOL → 1.5 SOL
+        let buyer_usdt = executor.balance_cache().get_balance(100, "USDT").unwrap();
+        assert_eq!(buyer_usdt.locked, Decimal::from(850)); // 1000 - 150
+        
+        let buyer_sol = executor.balance_cache().get_balance(100, "SOL").unwrap();
+        assert_eq!(buyer_sol.available, Decimal::from_f64_retain(1.5).unwrap()); // 0 + 1.5
+        
+        // 매도자: 10 SOL → 8.5 SOL, 0 USDT → 150 USDT
+        let seller_sol = executor.balance_cache().get_balance(200, "SOL").unwrap();
+        assert_eq!(seller_sol.locked, Decimal::from_f64_retain(8.5).unwrap()); // 10 - 1.5
+        
+        let seller_usdt = executor.balance_cache().get_balance(200, "USDT").unwrap();
+        assert_eq!(seller_usdt.available, Decimal::from(150)); // 0 + 150
+    }
+    
+    #[test]
+    fn test_executor_multiple_trades_skip_db_updates() {
+        // 여러 체결 처리 테스트 (시장가 주문 시나리오: skip_db_updates=true)
+        // 시장가 주문은 모든 매칭 완료 후 한 번에 DB 명령 전송
+        let mut executor = Executor::new_without_wal();
+        
+        // 초기 잔고
+        executor.balance_cache_mut().set_balance(100, "USDT", Decimal::ZERO, Decimal::from(1000));
+        executor.balance_cache_mut().set_balance(200, "SOL", Decimal::ZERO, Decimal::from(10));
+        
+        // 첫 번째 체결: 1 SOL @ 100 USDT
+        let match1 = MatchResult {
+            buy_order_id: 1,
+            sell_order_id: 2,
+            buyer_id: 100,
+            seller_id: 200,
+            price: Decimal::from(100),
+            amount: Decimal::from(1),
+            base_mint: "SOL".to_string(),
+            quote_mint: "USDT".to_string(),
+        };
+        
+        // 시장가 주문: DB 명령 전송 건너뛰기 (모든 매칭 완료 후 한 번에 전송)
+        executor.execute_trade(&match1, true).unwrap();
+        
+        // 두 번째 체결: 0.5 SOL @ 100 USDT
+        let match2 = MatchResult {
+            buy_order_id: 3,
+            sell_order_id: 2,
+            buyer_id: 100,
+            seller_id: 200,
+            price: Decimal::from(100),
+            amount: Decimal::from_f64_retain(0.5).unwrap(),
+            base_mint: "SOL".to_string(),
+            quote_mint: "USDT".to_string(),
+        };
+        
+        executor.execute_trade(&match2, true).unwrap();
+        
+        // 최종 잔고 확인 (메모리 업데이트는 정상적으로 수행되어야 함)
         // 매수자: 1000 USDT → 850 USDT, 0 SOL → 1.5 SOL
         let buyer_usdt = executor.balance_cache().get_balance(100, "USDT").unwrap();
         assert_eq!(buyer_usdt.locked, Decimal::from(850)); // 1000 - 150

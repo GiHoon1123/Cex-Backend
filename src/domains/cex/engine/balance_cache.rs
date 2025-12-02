@@ -207,12 +207,18 @@ impl BalanceCache {
             let from_balance = self.get_balance_mut(from_user, mint);
             if from_locked {
                 if from_balance.locked < amount {
-                    bail!("Insufficient locked balance");
+                    bail!(
+                        "Insufficient locked balance: user={}, mint={}, required={}, locked={}, available={}",
+                        from_user, mint, amount, from_balance.locked, from_balance.available
+                    );
                 }
                 from_balance.locked -= amount;
             } else {
                 if from_balance.available < amount {
-                    bail!("Insufficient available balance");
+                    bail!(
+                        "Insufficient available balance: user={}, mint={}, required={}, available={}, locked={}",
+                        from_user, mint, amount, from_balance.available, from_balance.locked
+                    );
                 }
                 from_balance.available -= amount;
             }

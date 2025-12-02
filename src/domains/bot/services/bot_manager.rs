@@ -207,53 +207,60 @@ impl BotManager {
     /// # 처리 순서
     /// 1. 봇이 참여한 거래 삭제 (foreign key 제약 때문에 먼저)
     /// 2. 봇의 모든 주문 삭제
+    /// 
+    /// 매수와 매도가 모두 봇인 거래만 삭제하여 일반 사용자의 거래 내역을 보존합니다.
     async fn delete_all_bot_data(&self, user_id: u64) -> Result<()> {
-        // 1. 봇의 주문 ID 목록 조회 (거래 삭제를 위해 필요)
-        let order_ids: Vec<i64> = sqlx::query_scalar(
+        // 1. 모든 봇 user_id 목록 생성
+        let mut bot_user_ids = Vec::new();
+        if let Some(bot1) = &self.bot1_user {
+            bot_user_ids.push(bot1.id as i64);
+        }
+        if let Some(bot2) = &self.bot2_user {
+            bot_user_ids.push(bot2.id as i64);
+        }
+        
+        if bot_user_ids.is_empty() {
+            return Ok(());
+        }
+        
+        // 2. 모든 봇의 주문 ID 목록 조회
+        let all_bot_order_ids: Vec<i64> = sqlx::query_scalar(
             r#"
-            SELECT id FROM orders WHERE user_id = $1
+            SELECT id FROM orders WHERE user_id = ANY($1)
             "#,
         )
-        .bind(user_id as i64)
+        .bind(&bot_user_ids)
         .fetch_all(self.db.pool())
         .await
         .context("Failed to fetch bot order IDs")?;
         
-        let order_count = order_ids.len();
-        let mut trade_count = 0u64;
-        
-        // 2. 봇이 참여한 거래 삭제 (foreign key 제약 때문에 먼저 삭제)
-        if !order_ids.is_empty() {
-            let deleted_trades = sqlx::query(
+        // 3. 매수와 매도가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
+        if !all_bot_order_ids.is_empty() {
+            sqlx::query(
                 r#"
                 DELETE FROM trades
-                WHERE buy_order_id = ANY($1) OR sell_order_id = ANY($1)
-                RETURNING id
+                WHERE buy_order_id = ANY($1) AND sell_order_id = ANY($1)
                 "#,
             )
-            .bind(&order_ids)
-            .fetch_all(self.db.pool())
-            .await
-            .context("Failed to delete bot trades")?;
-            
-            trade_count = deleted_trades.len() as u64;
-        }
-        
-        // 3. 봇의 모든 주문 삭제
-        if order_count > 0 {
-            let deleted_orders = sqlx::query(
-                r#"
-                DELETE FROM orders WHERE user_id = $1
-                RETURNING id
-                "#,
-            )
-            .bind(user_id as i64)
+            .bind(&all_bot_order_ids)
             .execute(self.db.pool())
             .await
-            .context("Failed to delete bot orders")?;
-            
-            // 봇 데이터 삭제 완료 (로그 제거 - 정상 동작은 조용히)
+            .context("Failed to delete bot-only trades")?;
         }
+        
+        // 4. 삭제 대상 봇의 주문 삭제
+        sqlx::query(
+            r#"
+            DELETE FROM orders WHERE user_id = $1
+            RETURNING id
+            "#,
+        )
+        .bind(user_id as i64)
+        .execute(self.db.pool())
+        .await
+        .context("Failed to delete bot orders")?;
+        
+        // 봇 데이터 삭제 완료 (로그 제거 - 정상 동작은 조용히)
         
         Ok(())
     }

@@ -68,18 +68,9 @@ impl BotCleanupScheduler {
                     continue;
                 }
                 
-                // 봇 1 데이터 삭제
-                if let Some(user_id) = bot1_user_id {
-                    if let Err(e) = Self::delete_bot_data_internal(&db, user_id).await {
-                        eprintln!("[Bot Cleanup Scheduler] Failed to delete bot1 data: {}", e);
-                    }
-                }
-                
-                // 봇 2 데이터 삭제
-                if let Some(user_id) = bot2_user_id {
-                    if let Err(e) = Self::delete_bot_data_internal(&db, user_id).await {
-                        eprintln!("[Bot Cleanup Scheduler] Failed to delete bot2 data: {}", e);
-                    }
+                // 봇 데이터 삭제 (두 봇의 주문 ID를 모두 수집하여 매수/매도가 모두 봇인 거래만 삭제)
+                if let Err(e) = Self::delete_bot_data_internal(&db, bot1_user_id, bot2_user_id).await {
+                    eprintln!("[Bot Cleanup Scheduler] Failed to delete bot data: {}", e);
                 }
             }
         });
@@ -87,40 +78,59 @@ impl BotCleanupScheduler {
     
     /// 봇 데이터 삭제 (내부 메서드)
     /// Delete bot data (internal method)
-    async fn delete_bot_data_internal(db: &Database, user_id: u64) -> Result<()> {
-        // 1. 봇의 주문 ID 목록 조회 (거래 삭제를 위해 필요)
-        let order_ids: Vec<i64> = sqlx::query_scalar(
+    /// 
+    /// 매수와 매도가 모두 봇인 거래만 삭제하여 일반 사용자의 거래 내역을 보존합니다.
+    async fn delete_bot_data_internal(
+        db: &Database,
+        bot1_user_id: Option<u64>,
+        bot2_user_id: Option<u64>,
+    ) -> Result<()> {
+        // 1. 봇 user_id 목록 생성
+        let mut bot_user_ids = Vec::new();
+        if let Some(id) = bot1_user_id {
+            bot_user_ids.push(id as i64);
+        }
+        if let Some(id) = bot2_user_id {
+            bot_user_ids.push(id as i64);
+        }
+        
+        if bot_user_ids.is_empty() {
+            return Ok(());
+        }
+        
+        // 2. 모든 봇의 주문 ID 목록 조회
+        let all_bot_order_ids: Vec<i64> = sqlx::query_scalar(
             r#"
-            SELECT id FROM orders WHERE user_id = $1
+            SELECT id FROM orders WHERE user_id = ANY($1)
             "#,
         )
-        .bind(user_id as i64)
+        .bind(&bot_user_ids)
         .fetch_all(db.pool())
         .await
         .context("Failed to fetch bot order IDs")?;
         
-        // 2. 봇이 참여한 거래 삭제 (foreign key 제약 때문에 먼저 삭제)
-        if !order_ids.is_empty() {
+        // 3. 매수와 매도가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
+        if !all_bot_order_ids.is_empty() {
             sqlx::query(
                 r#"
                 DELETE FROM trades
-                WHERE buy_order_id = ANY($1) OR sell_order_id = ANY($1)
+                WHERE buy_order_id = ANY($1) AND sell_order_id = ANY($1)
                 "#,
             )
-            .bind(&order_ids)
+            .bind(&all_bot_order_ids)
             .execute(db.pool())
             .await
-            .context("Failed to delete bot trades")?;
+            .context("Failed to delete bot-only trades")?;
         }
         
-        // 3. 봇의 모든 주문 삭제
-        if !order_ids.is_empty() {
+        // 4. 봇의 모든 주문 삭제
+        if !bot_user_ids.is_empty() {
             sqlx::query(
                 r#"
-                DELETE FROM orders WHERE user_id = $1
+                DELETE FROM orders WHERE user_id = ANY($1)
                 "#,
             )
-            .bind(user_id as i64)
+            .bind(&bot_user_ids)
             .execute(db.pool())
             .await
             .context("Failed to delete bot orders")?;

@@ -1,7 +1,6 @@
 use axum::{extract::State, Json, response::IntoResponse};
 use utoipa::ToSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use crate::shared::services::AppState;
 use crate::shared::database::UserRepository;
 
@@ -84,27 +83,47 @@ pub async fn delete_bot_data(
         }
     };
     
-    // 1. 봇의 주문 ID 목록 먼저 조회 (거래 삭제를 위해 필요)
-    let bot_order_ids: Vec<i64> = match sqlx::query(
-        "SELECT id FROM orders WHERE user_id = $1"
+    // 1. 모든 봇 user_id 조회 (bot1@bot.com, bot2@bot.com)
+    let mut bot_user_ids = Vec::new();
+    
+    // bot1@bot.com 조회
+    if let Ok(Some(bot1)) = user_repo.get_user_by_email("bot1@bot.com").await {
+        bot_user_ids.push(bot1.id as i64);
+    }
+    
+    // bot2@bot.com 조회
+    if let Ok(Some(bot2)) = user_repo.get_user_by_email("bot2@bot.com").await {
+        bot_user_ids.push(bot2.id as i64);
+    }
+    
+    if bot_user_ids.is_empty() {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, 
+            axum::Json(serde_json::json!({
+                "error": "No bot users found"
+            }))).into_response();
+    }
+    
+    // 2. 모든 봇의 주문 ID 목록 조회
+    let all_bot_order_ids: Vec<i64> = match sqlx::query_scalar(
+        "SELECT id FROM orders WHERE user_id = ANY($1)"
     )
-    .bind(user_id as i64)
+    .bind(&bot_user_ids)
     .fetch_all(db.pool())
     .await
     {
-        Ok(rows) => rows.iter().map(|row| row.get::<i64, _>("id")).collect(),
+        Ok(ids) => ids,
         Err(e) => {
             eprintln!("[Bot Handler] Failed to fetch bot orders: {}", e);
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
         }
     };
     
-    // 2. 봇이 참여한 거래 삭제 (주문 삭제 전에 먼저 삭제)
-    let deleted_trades = if !bot_order_ids.is_empty() {
+    // 3. 매수와 매도가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
+    let deleted_trades = if !all_bot_order_ids.is_empty() {
         match sqlx::query(
-            "DELETE FROM trades WHERE buy_order_id = ANY($1) OR sell_order_id = ANY($1) RETURNING id"
+            "DELETE FROM trades WHERE buy_order_id = ANY($1) AND sell_order_id = ANY($1) RETURNING id"
         )
-        .bind(&bot_order_ids)
+        .bind(&all_bot_order_ids)
         .fetch_all(db.pool())
         .await
         {

@@ -318,6 +318,9 @@ impl OrderService {
     /// 특정 주문 조회
     /// Get order by ID
     /// 
+    /// 활성 주문(pending, partial)은 엔진 메모리에서 실시간 조회합니다.
+    /// 완료 주문(filled, cancelled)은 DB에서 조회합니다.
+    /// 
     /// # Arguments
     /// * `user_id` - 조회하는 사용자 ID (권한 확인용)
     /// * `order_id` - 조회할 주문 ID
@@ -332,7 +335,8 @@ impl OrderService {
     ) -> Result<Order> {
         let order_repo = OrderRepository::new(self.db.pool().clone());
 
-        let order = order_repo
+        // DB에서 주문 조회
+        let mut order = order_repo
             .get_by_id(order_id)
             .await
             .context("Failed to fetch order from database")?
@@ -343,11 +347,42 @@ impl OrderService {
             bail!("Unauthorized: You don't own this order");
         }
 
+        // 활성 주문(pending, partial)인 경우 엔진 메모리에서 최신 정보 확인
+        if order.status == "pending" || order.status == "partial" {
+            // 엔진 메모리 OrderBook에서 해당 주문 찾기
+            let trading_pair = TradingPair::new(
+                order.base_mint.clone(),
+                order.quote_mint.clone(),
+            );
+            
+            let (buy_orders, sell_orders) = {
+                let engine_guard = self.engine.lock().await;
+                engine_guard
+                    .get_orderbook(&trading_pair, None)
+                    .await
+                    .context("Failed to get orderbook from engine")?
+            };
+
+            // 엔진 메모리에서 주문 찾기
+            let engine_order = buy_orders.iter()
+                .chain(sell_orders.iter())
+                .find(|o| o.id == order_id);
+
+            if let Some(engine_order_entry) = engine_order {
+                // 엔진 메모리 값으로 업데이트 (실시간 정확성 보장)
+                order = entry_to_order(engine_order_entry);
+            }
+            // 엔진 메모리에 없으면 DB 값 사용 (이미 체결되었을 수 있음)
+        }
+
         Ok(order)
     }
 
     /// 사용자의 모든 주문 조회
     /// Get all orders for user
+    /// 
+    /// 활성 주문(pending, partial)은 엔진 메모리에서 실시간 조회합니다.
+    /// 완료 주문(filled, cancelled)은 DB에서 조회합니다.
     /// 
     /// # Arguments
     /// * `user_id` - 사용자 ID
@@ -366,7 +401,8 @@ impl OrderService {
     ) -> Result<Vec<Order>> {
         let order_repo = OrderRepository::new(self.db.pool().clone());
 
-        let orders = if let Some(status) = status {
+        // DB에서 주문 목록 조회
+        let mut orders = if let Some(status) = status {
             order_repo
                 .get_by_user_and_status(user_id, status, limit, offset)
                 .await
@@ -377,6 +413,45 @@ impl OrderService {
                 .await
                 .context("Failed to fetch user orders from database")?
         };
+
+        // 활성 주문(pending, partial)인 경우 엔진 메모리에서 최신 정보 확인
+        // 모든 거래쌍의 OrderBook을 조회하여 활성 주문 업데이트
+        let engine_guard = self.engine.lock().await;
+        
+        // 활성 주문만 필터링
+        let active_orders: Vec<_> = orders.iter()
+            .filter(|o| o.status == "pending" || o.status == "partial")
+            .map(|o| (o.id, TradingPair::new(o.base_mint.clone(), o.quote_mint.clone())))
+            .collect();
+
+        // 각 활성 주문에 대해 엔진 메모리에서 최신 정보 확인
+        for order in &mut orders {
+            if order.status == "pending" || order.status == "partial" {
+                let trading_pair = TradingPair::new(
+                    order.base_mint.clone(),
+                    order.quote_mint.clone(),
+                );
+                
+                // 엔진 메모리 OrderBook에서 해당 주문 찾기
+                let (buy_orders, sell_orders) = match engine_guard
+                    .get_orderbook(&trading_pair, None)
+                    .await
+                {
+                    Ok(orders) => orders,
+                    Err(_) => continue, // 실패 시 DB 값 사용
+                };
+
+                // 엔진 메모리에서 주문 찾기
+                if let Some(engine_order_entry) = buy_orders.iter()
+                    .chain(sell_orders.iter())
+                    .find(|o| o.id == order.id)
+                {
+                    // 엔진 메모리 값으로 업데이트 (실시간 정확성 보장)
+                    *order = entry_to_order(engine_order_entry);
+                }
+                // 엔진 메모리에 없으면 DB 값 사용 (이미 체결되었을 수 있음)
+            }
+        }
 
         Ok(orders)
     }

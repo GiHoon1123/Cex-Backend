@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use crate::shared::database::{Database, TradeRepository, UserBalanceRepository};
 use crate::domains::cex::models::position::{AssetPosition, TradeSummary};
+use crate::domains::cex::engine::{Engine, runtime::HighPerformanceEngine};
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 
@@ -12,14 +14,15 @@ use rust_decimal::Decimal;
 /// - 현재 시장 가격 기반 평가액 계산
 /// 
 /// 포지션 계산 로직:
-/// 1. 사용자의 매수 거래 내역을 조회하여 평균 매수가 계산
-/// 2. 현재 보유 수량 조회 (user_balances 테이블)
-/// 3. 최근 체결가를 현재 시장 가격으로 사용
+/// 1. 사용자의 매수 거래 내역을 조회하여 평균 매수가 계산 (DB)
+/// 2. 현재 보유 수량 조회 (엔진 메모리 - 실시간 정확성 보장)
+/// 3. 최근 체결가를 현재 시장 가격으로 사용 (DB 또는 엔진 메모리)
 /// 4. 미실현 손익 = (현재 시장 가격 - 평균 매수가) × 보유 수량
 /// 5. 수익률 = (미실현 손익 / 총 매수 금액) × 100
 #[derive(Clone)]
 pub struct PositionService {
     db: Database,
+    engine: Arc<tokio::sync::Mutex<HighPerformanceEngine>>,
 }
 
 impl PositionService {
@@ -28,11 +31,12 @@ impl PositionService {
     /// 
     /// # Arguments
     /// * `db` - 데이터베이스 연결
+    /// * `engine` - 체결 엔진 (메모리 잔고 조회용)
     /// 
     /// # Returns
     /// PositionService 인스턴스
-    pub fn new(db: Database) -> Self {
-        Self { db }
+    pub fn new(db: Database, engine: Arc<tokio::sync::Mutex<HighPerformanceEngine>>) -> Self {
+        Self { db, engine }
     }
 
     /// 사용자의 특정 자산 포지션 정보 조회
@@ -58,19 +62,21 @@ impl PositionService {
         user_id: u64,
         mint: &str,
     ) -> Result<Option<AssetPosition>> {
-        // 1. 현재 잔고 조회
-        let balance_repo = UserBalanceRepository::new(self.db.pool().clone());
-        let balance = balance_repo
-            .get_by_user_and_mint(user_id, mint)
-            .await
-            .context("Failed to fetch user balance")?;
-
-        let (available, locked, current_balance) = if let Some(balance) = balance {
-            (balance.available, balance.locked, balance.available + balance.locked)
-        } else {
-            // 잔고가 없으면 포지션 정보도 없음
-            return Ok(None);
+        // 1. 현재 잔고 조회 (엔진 메모리에서 실시간 조회)
+        let (available, locked) = {
+            let engine_guard = self.engine.lock().await;
+            engine_guard
+                .get_balance(user_id, mint)
+                .await
+                .context("Failed to get balance from engine")?
         };
+
+        let current_balance = available + locked;
+
+        // 잔고가 없으면 포지션 정보도 없음
+        if current_balance == Decimal::ZERO {
+            return Ok(None);
+        }
 
         // 2. 매수 거래 통계 조회 (평균 매수가 계산용)
         let trade_repo = TradeRepository::new(self.db.pool().clone());
@@ -198,23 +204,34 @@ impl PositionService {
     /// - 잔고가 있는 자산만 반환
     /// - 매수 거래가 없는 자산도 포함 (평균 매수가 등이 None)
     pub async fn get_all_positions(&self, user_id: u64) -> Result<Vec<AssetPosition>> {
-        // 1. 사용자의 모든 잔고 조회
+        // 1. 사용자의 모든 잔고 조회 (DB에서 자산 목록 가져오고, 각각 엔진 메모리에서 잔고 확인)
         let balance_repo = UserBalanceRepository::new(self.db.pool().clone());
-        let balances = balance_repo
+        let db_balances = balance_repo
             .get_all_by_user(user_id)
             .await
-            .context("Failed to fetch user balances")?;
+            .context("Failed to fetch user balance list from database")?;
 
         // 2. 각 자산별로 포지션 정보 계산
         let mut positions = Vec::new();
-        for balance in balances {
+        let engine_guard = self.engine.lock().await;
+
+        for db_balance in db_balances {
             // USDT는 포지션 계산 대상이 아님 (기준 통화)
-            if balance.mint_address == "USDT" {
+            if db_balance.mint_address == "USDT" {
                 continue;
             }
 
-            if let Some(position) = self.get_position(user_id, &balance.mint_address).await? {
-                positions.push(position);
+            // 엔진 메모리에서 실시간 잔고 확인
+            let (available, locked) = engine_guard
+                .get_balance(user_id, &db_balance.mint_address)
+                .await
+                .unwrap_or((Decimal::ZERO, Decimal::ZERO)); // 실패 시 0으로 처리
+
+            // 잔고가 있으면 포지션 정보 계산
+            if available + locked > Decimal::ZERO {
+                if let Some(position) = self.get_position(user_id, &db_balance.mint_address).await? {
+                    positions.push(position);
+                }
             }
         }
 

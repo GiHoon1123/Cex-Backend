@@ -27,11 +27,11 @@ impl CexState {
     pub fn new(db: Database, engine: Arc<tokio::sync::Mutex<HighPerformanceEngine>>) -> Self {
         Self {
             engine: engine.clone(),
-            balance_service: BalanceService::new(db.clone()),
+            balance_service: BalanceService::new(db.clone(), engine.clone()),
             fee_service: FeeService::new(db.clone()),
-            order_service: OrderService::new(db.clone(), engine),
+            order_service: OrderService::new(db.clone(), engine.clone()),
             trade_service: TradeService::new(db.clone()),
-            position_service: PositionService::new(db),
+            position_service: PositionService::new(db, engine.clone()),
         }
     }
 }

@@ -1056,6 +1056,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "jsonwebtoken",
+ "libc",
  "nix 0.27.1",
  "parking_lot 0.12.5",
  "rand 0.8.5",

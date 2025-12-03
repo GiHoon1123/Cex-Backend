@@ -149,7 +149,13 @@ impl utoipa::Modify for SecurityAddon {
 #[tokio::main]
 async fn main() {
     // DB 연결
-    let db_url = "postgresql://root:1234@localhost/cex";
+    // Docker 컨테이너 환경에서는 컨테이너 이름으로 접근
+    // 로컬 개발 환경에서는 localhost 사용
+    let db_url = if std::env::var("RUST_ENV").unwrap_or_else(|_| "dev".to_string()) == "prod" {
+        "postgresql://root:1234@cex-postgres/cex"  // Docker 컨테이너 이름 사용
+    } else {
+        "postgresql://root:1234@localhost/cex"    // 로컬 개발 환경
+    };
     let db = Database::new(db_url)
         .await
         .expect("Failed to connect to database");

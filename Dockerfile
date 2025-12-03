@@ -15,11 +15,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 소스 코드 복사 및 빌드
-# 의존성 캐싱은 GitHub Actions의 cache-to/cache-from으로 처리
+# Docker BuildKit의 캐시 최적화 활용
 COPY . .
 
 # Rust 빌드 (의존성 + 애플리케이션)
-RUN cargo build --release
+# GitHub Actions의 cache-to/cache-from으로 의존성 캐싱 처리
+# 빌드 병렬화 및 최적화 옵션
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release
 
 # =====================================================
 # Stage 2: Runtime

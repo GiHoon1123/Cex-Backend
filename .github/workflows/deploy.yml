@@ -48,28 +48,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
-      
       - name: Set lowercase image name
         id: image
         run: |
           IMAGE_NAME_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           echo "IMAGE_NAME_LOWER=${IMAGE_NAME_LOWER}" >> $GITHUB_OUTPUT
       
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.IMAGE_NAME_LOWER }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+      
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.image.outputs.IMAGE_NAME_LOWER }}:latest,${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -108,22 +107,56 @@ jobs:
             # Docker 이미지 이름을 소문자로 변환
             IMAGE_NAME_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
             
-            # 프로젝트 디렉토리로 이동
-            cd ~/Cex-Backend || cd /home/${{ secrets.SERVER_USER }}/Cex-Backend || cd /opt/Cex-Backend
+            # 프로젝트 디렉토리 생성 및 이동
+            DEPLOY_DIR="/home/${{ secrets.SERVER_USER }}/cex-backend"
+            mkdir -p ${DEPLOY_DIR}
+            cd ${DEPLOY_DIR}
             
-            # Docker 배포 방식
-            docker pull ${IMAGE_NAME_LOWER}:latest
+            # docker-compose.yml 파일 생성 (없는 경우)
+            if [ ! -f docker-compose.yml ]; then
+              cat > docker-compose.yml << 'EOF'
+            version: '3.8'
             
-            # docker-compose.yml 파일이 있는지 확인 후 실행
-            if [ -f docker-compose.yml ]; then
-              docker-compose up -d
-            elif [ -f docker-compose.prod.yml ]; then
-              docker-compose -f docker-compose.prod.yml up -d
-            else
-              echo "Error: docker-compose.yml not found"
-              exit 1
+            services:
+              cex-backend:
+                image: ${IMAGE_NAME_LOWER}:latest
+                container_name: cex-backend
+                restart: unless-stopped
+                ports:
+                  - "3002:3002"
+                environment:
+                  - RUST_ENV=prod
+                  - RUST_LOG=info
+                cpuset_cpus: "0"
+                cap_add:
+                  - SYS_NICE
+                deploy:
+                  resources:
+                    limits:
+                      cpus: '1'
+                      memory: 1.5G
+                    reservations:
+                      cpus: '1'
+                      memory: 512M
+                healthcheck:
+                  test: ["CMD", "curl", "-f", "http://localhost:3002/api/health"]
+                  interval: 30s
+                  timeout: 3s
+                  retries: 3
+                  start_period: 10s
+            EOF
+              # 환경 변수 치환
+              sed -i "s|\${IMAGE_NAME_LOWER}|${IMAGE_NAME_LOWER}|g" docker-compose.yml
             fi
             
-            # 또는 바이너리 직접 배포 방식
-            # systemctl restart cex-backend
+            # Docker 이미지 pull
+            docker pull ${IMAGE_NAME_LOWER}:latest
+            
+            # Docker Compose로 재시작
+            docker-compose down
+            docker-compose up -d --force-recreate
+            
+            # 컨테이너 상태 확인
+            docker ps
+            docker-compose logs --tail=50
 

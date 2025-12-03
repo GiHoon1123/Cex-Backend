@@ -8,7 +8,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.repository_owner }}/${{ github.event.repository.name }}
 
 jobs:
   build:
@@ -58,12 +58,18 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
       
+      - name: Set lowercase image name
+        id: image
+        run: |
+          IMAGE_NAME_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_NAME_LOWER=${IMAGE_NAME_LOWER}" >> $GITHUB_OUTPUT
+      
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.image.outputs.IMAGE_NAME_LOWER }}:latest,${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -99,9 +105,24 @@ jobs:
           timeout: 30s
           command_timeout: 10m
           script: |
+            # Docker 이미지 이름을 소문자로 변환
+            IMAGE_NAME_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+            
+            # 프로젝트 디렉토리로 이동
+            cd ~/Cex-Backend || cd /home/${{ secrets.SERVER_USER }}/Cex-Backend || cd /opt/Cex-Backend
+            
             # Docker 배포 방식
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            docker-compose -f /path/to/docker-compose.yml up -d
+            docker pull ${IMAGE_NAME_LOWER}:latest
+            
+            # docker-compose.yml 파일이 있는지 확인 후 실행
+            if [ -f docker-compose.yml ]; then
+              docker-compose up -d
+            elif [ -f docker-compose.prod.yml ]; then
+              docker-compose -f docker-compose.prod.yml up -d
+            else
+              echo "Error: docker-compose.yml not found"
+              exit 1
+            fi
             
             # 또는 바이너리 직접 배포 방식
             # systemctl restart cex-backend

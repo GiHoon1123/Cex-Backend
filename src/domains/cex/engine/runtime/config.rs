@@ -144,7 +144,7 @@ impl CoreConfig {
             // nix 0.27에서는 sched API가 변경되었으므로 libc를 직접 사용
             use libc::{sched_param, SCHED_FIFO, sched_setscheduler};
             
-            let mut params = sched_param {
+            let params = sched_param {
                 sched_priority: priority as i32,
             };
             
@@ -155,7 +155,9 @@ impl CoreConfig {
             if result == 0 {
                 eprintln!("✅ Real-time scheduling enabled (priority: {})", priority);
             } else {
-                eprintln!("⚠️  Failed to set real-time scheduling (errno: {})", unsafe { *libc::__errno_location() });
+                use std::io;
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                eprintln!("⚠️  Failed to set real-time scheduling (errno: {})", errno);
                 eprintln!("   This is normal if running without root/CAP_SYS_NICE permissions");
             }
         }

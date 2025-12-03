@@ -107,56 +107,34 @@ jobs:
             # Docker 이미지 이름을 소문자로 변환
             IMAGE_NAME_LOWER=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
             
-            # 프로젝트 디렉토리 생성 및 이동
-            DEPLOY_DIR="/home/${{ secrets.SERVER_USER }}/cex-backend"
-            mkdir -p ${DEPLOY_DIR}
-            cd ${DEPLOY_DIR}
+            # 기존 컨테이너 중지 및 제거
+            docker stop cex-backend 2>/dev/null || true
+            docker rm cex-backend 2>/dev/null || true
             
-            # docker-compose.yml 파일 생성 (없는 경우)
-            if [ ! -f docker-compose.yml ]; then
-              cat > docker-compose.yml << 'EOF'
-            version: '3.8'
-            
-            services:
-              cex-backend:
-                image: ${IMAGE_NAME_LOWER}:latest
-                container_name: cex-backend
-                restart: unless-stopped
-                ports:
-                  - "3002:3002"
-                environment:
-                  - RUST_ENV=prod
-                  - RUST_LOG=info
-                cpuset_cpus: "0"
-                cap_add:
-                  - SYS_NICE
-                deploy:
-                  resources:
-                    limits:
-                      cpus: '1'
-                      memory: 1.5G
-                    reservations:
-                      cpus: '1'
-                      memory: 512M
-                healthcheck:
-                  test: ["CMD", "curl", "-f", "http://localhost:3002/api/health"]
-                  interval: 30s
-                  timeout: 3s
-                  retries: 3
-                  start_period: 10s
-            EOF
-              # 환경 변수 치환
-              sed -i "s|\${IMAGE_NAME_LOWER}|${IMAGE_NAME_LOWER}|g" docker-compose.yml
-            fi
-            
-            # Docker 이미지 pull
+            # 최신 Docker 이미지 pull
             docker pull ${IMAGE_NAME_LOWER}:latest
             
-            # Docker Compose로 재시작
-            docker-compose down
-            docker-compose up -d --force-recreate
+            # Docker 컨테이너 실행 (docker-compose.yml 없이 직접 실행)
+            docker run -d \
+              --name cex-backend \
+              --restart unless-stopped \
+              -p 3002:3002 \
+              --cpuset-cpus="0" \
+              --cap-add=SYS_NICE \
+              --cpus="1" \
+              --memory="1.5g" \
+              --memory-reservation="512m" \
+              -e RUST_ENV=prod \
+              -e RUST_LOG=info \
+              --health-cmd="curl -f http://localhost:3002/api/health || exit 1" \
+              --health-interval=30s \
+              --health-timeout=3s \
+              --health-retries=3 \
+              --health-start-period=10s \
+              ${IMAGE_NAME_LOWER}:latest
             
             # 컨테이너 상태 확인
+            sleep 5
             docker ps
-            docker-compose logs --tail=50
+            docker logs --tail=50 cex-backend
 

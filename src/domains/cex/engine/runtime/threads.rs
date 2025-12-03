@@ -1715,7 +1715,13 @@ pub fn db_writer_thread_loop(
     
     let mut batch = Vec::new();
     let batch_size_limit = 100;
-    let batch_time_limit = Duration::from_millis(10);
+    // 운영 환경에서는 flush 시간을 늘려서 Deadlock 확률 감소
+    // 운영: 1000ms, 로컬: 10ms
+    let batch_time_limit = if std::env::var("RUST_ENV").unwrap_or_else(|_| "dev".to_string()) == "prod" {
+        Duration::from_millis(1000)  // 운영: 1000ms
+    } else {
+        Duration::from_millis(10)   // 로컬: 10ms
+    };
     let mut last_flush = Instant::now();
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

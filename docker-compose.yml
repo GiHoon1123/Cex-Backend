@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  cex-backend:
+    build: .
+    image: cex-backend:latest
+    container_name: cex-backend
+    
+    # 환경 변수
+    environment:
+      - RUST_ENV=prod
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - RUST_LOG=info
+    
+    # 포트 매핑
+    ports:
+      - "3002:3002"
+    
+    # =====================================================
+    # 성능 극대화 설정 (필수)
+    # 엔진 성능 극대화를 위해 Core 0 고정 및 실시간 스케줄링 활성화
+    # =====================================================
+    
+    # 코어 고정: Core 0에 고정 (엔진 스레드 전용)
+    cpuset_cpus: "0"
+    
+    # 실시간 스케줄링 권한 (우선순위 99)
+    cap_add:
+      - SYS_NICE
+    
+    # 리소스 제한 (Core 0 전용)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'  # Core 0만 사용 (고정)
+          memory: 1.5G
+        reservations:
+          cpus: '1'  # Core 0 예약
+          memory: 512M
+    
+    # 재시작 정책
+    restart: unless-stopped
+    
+    # 헬스체크
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3002/api/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    
+    # 볼륨 마운트 (필요시)
+    # volumes:
+    #   - ./logs:/app/logs
+    #   - ./data:/app/data
+

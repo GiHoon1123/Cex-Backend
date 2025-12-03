@@ -145,7 +145,7 @@ impl utoipa::Modify for SecurityAddon {
 #[tokio::main]
 async fn main() {
     // DB 연결
-    let db_url = "postgresql://root:1234@localhost/solana_api";
+    let db_url = "postgresql://root:1234@localhost/cex";
     let db = Database::new(db_url)
         .await
         .expect("Failed to connect to database");
@@ -314,7 +314,7 @@ async fn main() {
     
     eprintln!("[Main] Server running on http://localhost:3002");
     eprintln!("[Main] Swagger UI available at http://localhost:3002/api");
-    eprintln!("[Main] Database: PostgreSQL (solana_api)");
+    eprintln!("[Main] Database: PostgreSQL (cex)");
     
     // 서버 실행
     axum::serve(listener, app)

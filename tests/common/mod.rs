@@ -24,7 +24,7 @@ use cex_backend::domains::cex::engine::types::OrderEntry;
 use cex_backend::domains::cex::engine::Engine;
 
 // 테스트용 상수
-pub const TEST_DATABASE_URL: &str = "postgresql://root:1234@localhost/solana_api_test";
+pub const TEST_DATABASE_URL: &str = "postgresql://root:1234@localhost/cex_test";
 pub const TEST_USER_ID: u64 = 1;  // 실제 테스트에 사용할 유저 ID
 pub const NUM_TEST_USERS: u64 = 100;  // 오더북 채우기용 유저 수
 

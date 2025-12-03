@@ -29,12 +29,14 @@ CREATE TABLE IF NOT EXISTS trades (
     -- buy_order_id: 매수 주문 ID (누가 구매했는지)
     -- sell_order_id: 매도 주문 ID (누가 판매했는지)
     -- 주의: 봇 주문과 사용자 주문 모두 동일하게 참조됨
-    buy_order_id BIGINT NOT NULL REFERENCES orders(id),   -- 매수 주문 ID
-    sell_order_id BIGINT NOT NULL REFERENCES orders(id),  -- 매도 주문 ID
+    -- CASCADE: orders 삭제 시 관련 trades도 자동 삭제
+    buy_order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,   -- 매수 주문 ID
+    sell_order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,  -- 매도 주문 ID
     
     -- 체결 참여자 정보 (주문 테이블을 다시 조회하지 않고 바로 사용하기 위함)
-    buyer_id BIGINT NOT NULL REFERENCES users(id),   -- 매수자 사용자 ID
-    seller_id BIGINT NOT NULL REFERENCES users(id),  -- 매도자 사용자 ID
+    -- CASCADE: users 삭제 시 관련 trades도 자동 삭제
+    buyer_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,   -- 매수자 사용자 ID
+    seller_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- 매도자 사용자 ID
     
     -- 거래쌍 정보 (주문에서 복사)
     base_mint VARCHAR(255) NOT NULL,   -- 기준 자산 (예: SOL)
@@ -56,10 +58,10 @@ COMMENT ON TABLE trades IS '체결 내역 테이블 (주문 매칭 후 실제 �
 
 -- 컬럼 코멘트
 COMMENT ON COLUMN trades.id IS '체결 내역 고유 ID';
-COMMENT ON COLUMN trades.buy_order_id IS '매수 주문 ID (누가 구매했는지, 봇 주문 포함)';
-COMMENT ON COLUMN trades.sell_order_id IS '매도 주문 ID (누가 판매했는지, 봇 주문 포함)';
-COMMENT ON COLUMN trades.buyer_id IS '매수자 사용자 ID (orders.user_id와 동일, 빠른 조회용)';
-COMMENT ON COLUMN trades.seller_id IS '매도자 사용자 ID (orders.user_id와 동일, 빠른 조회용)';
+COMMENT ON COLUMN trades.buy_order_id IS '매수 주문 ID (누가 구매했는지, 봇 주문 포함, orders 삭제 시 CASCADE 삭제)';
+COMMENT ON COLUMN trades.sell_order_id IS '매도 주문 ID (누가 판매했는지, 봇 주문 포함, orders 삭제 시 CASCADE 삭제)';
+COMMENT ON COLUMN trades.buyer_id IS '매수자 사용자 ID (orders.user_id와 동일, 빠른 조회용, users 삭제 시 CASCADE 삭제)';
+COMMENT ON COLUMN trades.seller_id IS '매도자 사용자 ID (orders.user_id와 동일, 빠른 조회용, users 삭제 시 CASCADE 삭제)';
 COMMENT ON COLUMN trades.base_mint IS '거래된 자산 (SOL, USDC 등)';
 COMMENT ON COLUMN trades.quote_mint IS '기준 통화 (항상 USDT)';
 COMMENT ON COLUMN trades.price IS '체결 가격 (USDT 기준, 예: SOL 1개 = 100 USDT)';
@@ -79,4 +81,10 @@ CREATE INDEX IF NOT EXISTS idx_trades_sell_order ON trades(sell_order_id, create
 -- 사용자별 체결 내역 조회
 CREATE INDEX IF NOT EXISTS idx_trades_buyer ON trades(buyer_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_seller ON trades(seller_id, created_at DESC);
+
+-- 제약조건 코멘트 (CASCADE 설정 명시)
+COMMENT ON CONSTRAINT trades_buy_order_id_fkey ON trades IS '매수 주문 ID 외래키 (orders 삭제 시 CASCADE 삭제)';
+COMMENT ON CONSTRAINT trades_sell_order_id_fkey ON trades IS '매도 주문 ID 외래키 (orders 삭제 시 CASCADE 삭제)';
+COMMENT ON CONSTRAINT trades_buyer_id_fkey ON trades IS '매수자 사용자 ID 외래키 (users 삭제 시 CASCADE 삭제)';
+COMMENT ON CONSTRAINT trades_seller_id_fkey ON trades IS '매도자 사용자 ID 외래키 (users 삭제 시 CASCADE 삭제)';
 

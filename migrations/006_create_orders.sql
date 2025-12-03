@@ -58,9 +58,11 @@ CREATE TABLE IF NOT EXISTS orders (
     -- 주문 수량 정보
     -- amount: 주문한 총 수량 (base_mint 기준)
     -- filled_amount: 체결된 수량 (부분 체결 가능)
+    -- filled_quote_amount: 체결된 금액 (USDT 기준, 시장가 주문의 총 결제 금액)
     -- 예: SOL 10개 주문 → 3개 체결 → amount=10.0, filled_amount=3.0
     amount DECIMAL(30, 9) NOT NULL,              -- 주문 수량 (base_mint)
     filled_amount DECIMAL(30, 9) NOT NULL DEFAULT 0,  -- 체결된 수량
+    filled_quote_amount DECIMAL(20, 8) NOT NULL DEFAULT 0,  -- 체결된 금액 (USDT 기준, 시장가 주문의 총 결제 금액)
     
     -- 주문 상태
     -- - 'pending': 대기 중 (체결 안 됨)
@@ -88,6 +90,7 @@ COMMENT ON COLUMN orders.quote_mint IS '기준 통화 (항상 USDT)';
 COMMENT ON COLUMN orders.price IS '지정가 가격 (USDT 기준, 시장가 주문은 NULL)';
 COMMENT ON COLUMN orders.amount IS '주문 수량 (base_mint 기준, 예: SOL 1.0개)';
 COMMENT ON COLUMN orders.filled_amount IS '체결된 수량 (부분 체결 가능, amount와 같으면 전량 체결)';
+COMMENT ON COLUMN orders.filled_quote_amount IS '체결된 금액 (USDT 기준, 시장가 주문의 총 결제 금액)';
 COMMENT ON COLUMN orders.status IS '주문 상태: pending(대기), partial(부분체결), filled(완료), cancelled(취소)';
 COMMENT ON COLUMN orders.created_at IS '주문 생성 시간';
 COMMENT ON COLUMN orders.updated_at IS '주문 정보 마지막 업데이트 시간';

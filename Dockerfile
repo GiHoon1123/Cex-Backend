@@ -1,0 +1,59 @@
+# =====================================================
+# Multi-stage Dockerfile for CEX Backend
+# =====================================================
+# Stage 1: Build
+FROM rust:1.75-slim as builder
+
+WORKDIR /app
+
+# 시스템 의존성 설치 (빌드용)
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cargo 레이어 캐싱을 위한 의존성만 먼저 복사
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# 의존성 빌드 (캐시 활용)
+RUN cargo build --release && \
+    rm -rf src
+
+# 소스 코드 복사 및 빌드
+COPY . .
+RUN touch src/main.rs && \
+    cargo build --release
+
+# =====================================================
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# 런타임 의존성만 설치
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 바이너리 복사
+COPY --from=builder /app/target/release/cex-backend /usr/local/bin/cex-backend
+
+# 환경 변수
+ENV RUST_ENV=prod
+ENV RUST_LOG=info
+
+# 포트 노출
+EXPOSE 3002
+
+# 헬스체크 (선택적)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3002/api/health || exit 1
+
+# 실행
+# 주의: 코어 고정 및 실시간 스케줄링을 위해
+# docker-compose.yml에서 cpuset_cpus와 cap_add 설정 필요
+CMD ["cex-backend"]
+

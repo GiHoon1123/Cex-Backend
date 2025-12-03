@@ -12,7 +12,7 @@ pub struct Database {
 impl Database {
     // 데이터베이스 연결 생성
     // Create database connection
-    // db_url: PostgreSQL 연결 문자열 (예: "postgresql://root:1234@localhost/solana_api")
+    // db_url: PostgreSQL 연결 문자열 (예: "postgresql://root:1234@localhost/cex")
     pub async fn new(db_url: &str) -> Result<Self> {
         // PostgreSQL 연결 풀 생성
         // Create PostgreSQL connection pool

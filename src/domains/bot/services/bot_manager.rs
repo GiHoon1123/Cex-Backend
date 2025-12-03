@@ -382,7 +382,7 @@ mod tests {
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://root:1234@localhost:5432/solana_api_test".to_string());
+            .unwrap_or_else(|_| "postgresql://root:1234@localhost:5432/cex_test".to_string());
         PgPool::connect(&database_url).await.unwrap()
     }
 

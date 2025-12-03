@@ -1,0 +1,73 @@
+version: '3.8'
+
+# =====================================================
+# 프로덕션 배포용 Docker Compose 설정
+# =====================================================
+# 엔진 성능 극대화를 위한 최적화 설정
+# - Core 0 고정 (cpuset_cpus)
+# - 실시간 스케줄링 (cap_add: SYS_NICE)
+# - 우선순위 99 (애플리케이션 내부 설정)
+# =====================================================
+
+services:
+  cex-backend:
+    build: .
+    image: cex-backend:latest
+    container_name: cex-backend
+    
+    # 환경 변수
+    environment:
+      - RUST_ENV=prod
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - RUST_LOG=info
+    
+    # 포트 매핑
+    ports:
+      - "3002:3002"
+    
+    # =====================================================
+    # 성능 극대화 설정 (필수)
+    # =====================================================
+    
+    # 코어 고정: Core 0에 고정
+    # 엔진 스레드가 항상 Core 0에서 실행되도록 보장
+    cpuset_cpus: "0"
+    
+    # 실시간 스케줄링 권한
+    # SCHED_FIFO 우선순위 99 설정을 위해 필요
+    cap_add:
+      - SYS_NICE
+    
+    # 리소스 제한 (Core 0 전용)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'  # Core 0만 사용 (고정)
+          memory: 1.5G
+        reservations:
+          cpus: '1'  # Core 0 예약
+          memory: 512M
+    
+    # =====================================================
+    # 운영 설정
+    # =====================================================
+    
+    # 재시작 정책
+    restart: unless-stopped
+    
+    # 헬스체크
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3002/api/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    
+    # 로그 설정
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+

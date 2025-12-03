@@ -33,7 +33,7 @@ mod tests {
     async fn create_test_db() -> Database {
         // 테스트용 DB URL (실제 테스트 DB 사용)
         let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://root:1234@localhost:5432/solana_api_test".to_string());
+            .unwrap_or_else(|_| "postgresql://root:1234@localhost:5432/cex_test".to_string());
         
         Database::new(&database_url).await.expect("Failed to create test database")
     }

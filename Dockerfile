@@ -14,18 +14,11 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Cargo 레이어 캐싱을 위한 의존성만 먼저 복사
-COPY Cargo.toml Cargo.lock ./
-
-# 의존성만 빌드 (캐시 활용)
-# 더미 main.rs 생성하여 의존성만 빌드
-RUN mkdir src && \
-    echo "fn main() {}" > src/main.rs && \
-    cargo build --release && \
-    rm -rf src
-
 # 소스 코드 복사 및 빌드
+# 의존성 캐싱은 GitHub Actions의 cache-to/cache-from으로 처리
 COPY . .
+
+# Rust 빌드 (의존성 + 애플리케이션)
 RUN cargo build --release
 
 # =====================================================

@@ -2,7 +2,7 @@
 # Multi-stage Dockerfile for CEX Backend
 # =====================================================
 # Stage 1: Build
-FROM rust:1.75-slim as builder
+FROM rust:latest as builder
 
 WORKDIR /app
 

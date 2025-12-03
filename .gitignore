@@ -1,6 +1,6 @@
 # Rust
 target/
-Cargo.lock
+# Cargo.lock은 바이너리 프로젝트이므로 커밋해야 함 (제외하지 않음)
 
 # IDE
 .idea/

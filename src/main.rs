@@ -226,6 +226,18 @@ async fn main() {
     
     eprintln!("[Main] Engine started successfully (bot balances loaded from DB)");
     
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // UDP 오더북 피드 시작 (UDP 멀티캐스트)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    eprintln!("[Main] Starting UDP orderbook feed...");
+    let udp_feed = crate::domains::cex::services::UdpOrderbookFeed::new(
+        app_state.engine.clone(),
+        None, // 기본 설정 사용 (224.0.0.1:5000, 100ms 간격)
+    ).await.expect("Failed to create UDP orderbook feed");
+    
+    udp_feed.start();
+    eprintln!("[Main] UDP orderbook feed started: multicast=224.0.0.1:5000, interval=100ms");
+    
     // 바이낸스 클라이언트 생성
     let binance_client = BinanceClient::new(bot_config.binance_ws_url.clone());
     

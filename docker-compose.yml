@@ -9,9 +9,8 @@ services:
     # 환경 변수
     environment:
       - RUST_ENV=prod
-      - DATABASE_URL=${DATABASE_URL}
-      - JWT_SECRET=${JWT_SECRET}
       - RUST_LOG=info
+      # DATABASE_URL과 JWT_SECRET은 코드에서 하드코딩됨
     
     # 포트 매핑
     ports:

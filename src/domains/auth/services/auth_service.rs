@@ -20,8 +20,8 @@ impl AuthService {
     pub fn new(db: Database) -> Self {
         // JWT Service는 AppState에서 주입받아야 하는데, 순환 참조를 피하기 위해
         // 여기서는 임시로 생성 (실제로는 AppState에서 주입받아야 함)
-        let jwt_secret = std::env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "your-secret-key-change-in-production".to_string());
+        // JWT_SECRET 하드코딩 (배포 서버용)
+        let jwt_secret = "cex-backend-jwt-secret-key-2024-production".to_string();
         let jwt_service = JwtService::new(jwt_secret);
         
         Self { 

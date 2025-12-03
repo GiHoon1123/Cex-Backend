@@ -458,21 +458,21 @@ pub(crate) fn process_submit_order(
     let is_market_order = order.order_side == "market";
     if !is_market_order {
         // 지정가 주문만 처음에 InsertOrder 전송 (pending 상태)
-        if let Some(tx) = db_tx {
-            let db_cmd = super::db_commands::DbCommand::InsertOrder {
+    if let Some(tx) = db_tx {
+        let db_cmd = super::db_commands::DbCommand::InsertOrder {
                 order_id: order.id,  // 임시 ID (0), DB Writer가 실제 ID 생성
-                user_id: order.user_id,
-                order_type: order.order_type.clone(),
-                order_side: order.order_side.clone(),
-                base_mint: order.base_mint.clone(),
-                quote_mint: order.quote_mint.clone(),
-                price: order.price,
-                amount: order.amount,
-                created_at: order.created_at,
+            user_id: order.user_id,
+            order_type: order.order_type.clone(),
+            order_side: order.order_side.clone(),
+            base_mint: order.base_mint.clone(),
+            quote_mint: order.quote_mint.clone(),
+            price: order.price,
+            amount: order.amount,
+            created_at: order.created_at,
                 status: None, // None이면 "pending"
                 filled_amount: None, // None이면 0
                 filled_quote_amount: None, // None이면 0
-            };
+        };
             let _ = tx.send(db_cmd); // Non-blocking, 배치로 처리됨
         }
     }
@@ -548,9 +548,9 @@ pub(crate) fn process_submit_order(
                                  match_result.buy_order_id, match_result.sell_order_id, 
                                  match_result.buyer_id, match_result.seller_id, e);
                         // 실패한 매칭은 무시하고 계속 진행
-                    }
                 }
             }
+        }
         }
         
         // 디버깅: 성공한 매칭 확인
@@ -594,7 +594,7 @@ pub(crate) fn process_submit_order(
         }
         
         // 모든 매칭 완료 후 DB 업데이트 명령을 한 번에 전송
-        if let Some(tx) = db_tx {
+                    if let Some(tx) = db_tx {
             // 잔고 변경 집계: (user_id, mint) -> (available_delta, locked_delta)
             let mut balance_changes: HashMap<(u64, String), (Decimal, Decimal)> = HashMap::new();
             
@@ -645,11 +645,11 @@ pub(crate) fn process_submit_order(
                     base_mint: match_result.base_mint.clone(),
                     quote_mint: match_result.quote_mint.clone(),
                     timestamp: Utc::now(),
-                };
-                if let Err(e) = tx.send(db_cmd) {
+                        };
+                        if let Err(e) = tx.send(db_cmd) {
                     eprintln!("Failed to send InsertTrade command: {}", e);
-                }
-            }
+                        }
+                    }
             
             // 2. UpdateBalance 명령 전송 (집계된 잔고 변경)
             for ((user_id, mint), (available_delta, locked_delta)) in balance_changes {
@@ -2049,7 +2049,7 @@ async fn flush_batch(
     // 트랜잭션 커밋
     tx.commit().await
         .context("Failed to commit transaction")?;
-    
-    Ok(())
+            
+            Ok(())
 }
 

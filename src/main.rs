@@ -1,7 +1,7 @@
 use axum::Router;
-use axum::http::{Method, HeaderValue};
+use axum::http::Method;
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{CorsLayer, AllowOrigin};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -24,6 +24,7 @@ use crate::domains::cex::models::*;
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        crate::shared::handlers::health::health_check,
         crate::domains::swap::handlers::swap_handler::get_quote,
         crate::domains::swap::handlers::swap_handler::create_swap_transaction,
         crate::domains::swap::handlers::token_handler::search_tokens,
@@ -92,6 +93,8 @@ use crate::domains::cex::models::*;
         OrdersResponse,
         OrderBookEntry,
         OrderBookResponse,
+        crate::domains::cex::handlers::order_handler::OrderbookResponse,
+        crate::shared::handlers::health::HealthResponse,
         Trade,
         TradesResponse,
         AssetPosition,
@@ -113,7 +116,8 @@ use crate::domains::cex::models::*;
         (name = "CEX Orders", description = "CEX Exchange order API endpoints"),
         (name = "CEX Trades", description = "CEX Exchange trade API endpoints"),
         (name = "CEX Positions", description = "CEX Exchange position API endpoints (P&L, average entry price)"),
-        (name = "Bot", description = "Bot management API endpoints (delete bot data)")
+        (name = "Bot", description = "Bot management API endpoints (delete bot data)"),
+        (name = "Health", description = "Health check API endpoints")
     ),
     info(
         title = "Solana API Server",
@@ -281,21 +285,58 @@ async fn main() {
     }
 
     // CORS 설정
-    let cors = CorsLayer::new()
-        .allow_origin("http://localhost:3003".parse::<HeaderValue>().unwrap())
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            axum::http::header::ACCEPT,
-        ])
-        .allow_credentials(true);
+    // 개발 환경: localhost 허용, 프로덕션: 모든 origin 허용 (또는 특정 도메인만)
+    let cors = if std::env::var("RUST_ENV").unwrap_or_else(|_| "dev".to_string()) == "prod" {
+        // 프로덕션: 모든 origin 허용
+        // AllowOrigin::any()를 사용하면 브라우저에서 제대로 작동합니다
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::any())
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+                Method::PATCH,
+            ])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::ACCEPT,
+                axum::http::header::ORIGIN,
+            ])
+            .allow_credentials(false) // 모든 origin 허용 시 credentials는 false
+            .expose_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ])
+        // 특정 도메인만 허용하려면:
+        // .allow_origin(AllowOrigin::exact("https://your-frontend-domain.vercel.app".parse().unwrap()))
+        // .allow_credentials(true)
+    } else {
+        // 개발 환경: localhost만 허용
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::exact("http://localhost:3003".parse().unwrap()))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+                Method::PATCH,
+            ])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::ACCEPT,
+                axum::http::header::ORIGIN,
+            ])
+            .allow_credentials(true)
+            .expose_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ])
+    };
 
     // Router 생성
     let app = Router::new()

@@ -118,8 +118,8 @@ impl BotCleanupScheduler {
         
         // 3. 일반 사용자가 참여한 trade에 참여한 봇 order는 보존하고, 나머지만 삭제
         // 봇끼리만 거래한 trade에 참여한 order만 삭제
-        sqlx::query(
-            r#"
+            sqlx::query(
+                r#"
             DELETE FROM orders
             WHERE user_id = ANY($1)
             AND id NOT IN (
@@ -129,12 +129,12 @@ impl BotCleanupScheduler {
                 SELECT DISTINCT sell_order_id FROM trades
                 WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
             )
-            "#,
-        )
+                "#,
+            )
         .bind(&bot_user_ids)
-        .execute(db.pool())
-        .await
-        .context("Failed to delete bot orders")?;
+            .execute(db.pool())
+            .await
+            .context("Failed to delete bot orders")?;
         
         Ok(())
     }

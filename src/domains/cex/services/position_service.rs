@@ -80,16 +80,16 @@ impl PositionService {
             } else {
                 // 엔진 메모리에 잔고가 없으면 DB에서 조회 (fallback)
                 // 엔진 lock을 해제한 후 DB 조회 (데드락 방지)
-                let balance_repo = UserBalanceRepository::new(self.db.pool().clone());
+        let balance_repo = UserBalanceRepository::new(self.db.pool().clone());
                 if let Some(db_balance) = balance_repo
-                    .get_by_user_and_mint(user_id, mint)
-                    .await
+            .get_by_user_and_mint(user_id, mint)
+            .await
                     .context("Failed to fetch balance from database")?
                 {
                     (db_balance.available, db_balance.locked)
-                } else {
+        } else {
                     // DB에도 없으면 잔고 없음
-                    return Ok(None);
+            return Ok(None);
                 }
             }
         };

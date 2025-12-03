@@ -245,7 +245,7 @@ impl BotManager {
         // 3. 일반 사용자가 참여한 trade에 참여한 봇 order는 보존하고, 나머지만 삭제
         // 일반 사용자가 참여한 trade = buyer_id나 seller_id 중 하나라도 봇이 아닌 trade
         sqlx::query(
-            r#"
+                r#"
             DELETE FROM orders
             WHERE user_id = ANY($1)
             AND id NOT IN (
@@ -255,12 +255,12 @@ impl BotManager {
                 SELECT DISTINCT sell_order_id FROM trades
                 WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
             )
-            "#,
-        )
+                "#,
+            )
         .bind(&bot_user_ids)
-        .execute(self.db.pool())
-        .await
-        .context("Failed to delete bot orders")?;
+            .execute(self.db.pool())
+            .await
+            .context("Failed to delete bot orders")?;
         
         Ok(())
     }

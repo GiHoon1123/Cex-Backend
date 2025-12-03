@@ -68,6 +68,7 @@ core_affinity = "0.8"
 
 # 실시간 스케줄링 (Linux only)
 nix = { version = "0.27", features = ["sched"] }
+libc = "0.2"  # 실시간 스케줄링용 (sched_setscheduler)
 
 # 벤치마크 (TPS 측정)
 criterion = { version = "0.5", features = ["html_reports"] }

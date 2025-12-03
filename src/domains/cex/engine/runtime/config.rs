@@ -141,18 +141,22 @@ impl CoreConfig {
     pub fn set_realtime_scheduling(priority: u8) {
         #[cfg(target_os = "linux")]
         {
-            use nix::sched::{sched_setscheduler, SchedPolicy, SchedParam};
-            use nix::unistd::Pid;
+            // nix 0.27에서는 sched API가 변경되었으므로 libc를 직접 사용
+            use libc::{sched_param, SCHED_FIFO, sched_setscheduler};
             
-            let params = SchedParam { sched_priority: priority as i32 };
-            match sched_setscheduler(Pid::from_raw(0), SchedPolicy::Fifo, &params) {
-                Ok(_) => {
-                    eprintln!("✅ Real-time scheduling enabled (priority: {})", priority);
-                }
-                Err(e) => {
-                    eprintln!("⚠️  Failed to set real-time scheduling: {}", e);
-                    eprintln!("   This is normal if running without root/CAP_SYS_NICE permissions");
-                }
+            let mut params = sched_param {
+                sched_priority: priority as i32,
+            };
+            
+            let result = unsafe {
+                sched_setscheduler(0, SCHED_FIFO, &params)
+            };
+            
+            if result == 0 {
+                eprintln!("✅ Real-time scheduling enabled (priority: {})", priority);
+            } else {
+                eprintln!("⚠️  Failed to set real-time scheduling (errno: {})", unsafe { *libc::__errno_location() });
+                eprintln!("   This is normal if running without root/CAP_SYS_NICE permissions");
             }
         }
         

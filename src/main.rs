@@ -159,7 +159,7 @@ async fn main() {
         }
     });
     let db_url = format!("postgresql://root:1234@{}/cex", db_host);
-    let db = Database::new(db_url)
+    let db = Database::new(&db_url)
         .await
         .expect("Failed to connect to database");
 

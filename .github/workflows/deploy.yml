@@ -111,15 +111,21 @@ jobs:
             docker stop cex-backend 2>/dev/null || true
             docker rm cex-backend 2>/dev/null || true
             
+            # 사용자 정의 네트워크 생성 (없으면 생성)
+            docker network create cex-network 2>/dev/null || true
+            
+            # PostgreSQL 컨테이너를 네트워크에 연결 (이미 연결되어 있으면 무시)
+            docker network connect cex-network cex-postgres 2>/dev/null || true
+            
             # 최신 Docker 이미지 pull
             docker pull ${IMAGE_NAME_LOWER}:latest
             
             # Docker 컨테이너 실행 (docker-compose.yml 없이 직접 실행)
-            # bridge 네트워크를 명시적으로 지정하여 cex-postgres와 같은 네트워크 사용
+            # cex-network를 사용하여 컨테이너 이름으로 DNS 조회 가능
             docker run -d \
               --name cex-backend \
               --restart unless-stopped \
-              --network bridge \
+              --network cex-network \
               -p 3002:3002 \
               --cpuset-cpus="0" \
               --cap-add=SYS_NICE \
@@ -128,7 +134,7 @@ jobs:
               --memory-reservation="512m" \
               -e RUST_ENV=prod \
               -e RUST_LOG=info \
-              -e DATABASE_HOST=172.17.0.2 \
+              -e DATABASE_HOST=cex-postgres \
               --health-cmd="curl -f http://localhost:3002/api/health || exit 1" \
               --health-interval=30s \
               --health-timeout=3s \

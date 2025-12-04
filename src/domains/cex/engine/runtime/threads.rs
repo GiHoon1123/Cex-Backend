@@ -1834,26 +1834,107 @@ pub fn db_writer_thread_loop(
 /// 1. 트랜잭션 시작
 /// 2. 각 명령 처리
 /// 3. 커밋
+/// Deadlock 에러 확인 헬퍼 함수
+/// 
+/// PostgreSQL의 Deadlock 에러 코드 40P01을 확인합니다.
+fn is_deadlock_error(e: &anyhow::Error) -> bool {
+    let error_str = e.to_string();
+    error_str.contains("deadlock") || error_str.contains("40P01")
+}
+
+/// 배치를 DB에 쓰기 (Deadlock 재시도 로직 포함)
+/// 
+/// # 처리 과정
+/// 1. UpdateBalance 명령 집계 (같은 (user_id, mint) 조합의 delta 합산)
+/// 2. 배치 정렬 (외래키 제약조건을 위해)
+/// 3. 트랜잭션 시작 및 명령 처리
+/// 4. Deadlock 발생 시 재시도 (최대 3회)
+/// 
+/// # Deadlock 처리
+/// - Deadlock 발생 시 트랜잭션 롤백 후 재시도
+/// - 재시도 간격: 100ms, 200ms, 300ms (지수 백오프)
+/// - 최대 3회 재시도 후 실패 시 에러 반환
 async fn flush_batch(
     batch: &mut Vec<super::db_commands::DbCommand>,
     db_pool: &PgPool,
 ) -> Result<()> {
     use super::db_commands::DbCommand;
+    use std::collections::HashMap;
+    use std::time::Duration;
     
     if batch.is_empty() {
         return Ok(());
     }
     
-    // 트랜잭션 시작
-    let mut tx = db_pool.begin().await
-        .context("Failed to begin transaction")?;
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 1. UpdateBalance 명령 집계 (Deadlock 확률 감소)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 같은 (user_id, mint) 조합의 UpdateBalance 명령을 집계하여
+    // 한 번만 UPDATE 실행하도록 합니다.
+    // 이렇게 하면 같은 행을 여러 번 업데이트하지 않아 Deadlock 확률이 감소합니다.
+    let mut balance_updates: HashMap<(u64, String), (rust_decimal::Decimal, rust_decimal::Decimal)> = HashMap::new();
+    let mut other_commands = Vec::new();
     
-    // 배치 정렬: InsertOrder를 먼저 처리 (외래키 제약조건을 위해)
+    // 배치를 순회하면서 UpdateBalance 명령을 집계
+    for cmd in batch.iter() {
+        match cmd {
+            DbCommand::UpdateBalance { user_id, mint, available_delta, locked_delta } => {
+                // 같은 (user_id, mint) 조합의 delta를 합산
+                let key = (*user_id, mint.clone());
+                let entry = balance_updates.entry(key).or_insert((rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO));
+                
+                // available_delta 합산
+                if let Some(delta) = available_delta {
+                    entry.0 += *delta;
+                }
+                
+                // locked_delta 합산
+                if let Some(delta) = locked_delta {
+                    entry.1 += *delta;
+                }
+            }
+            _ => {
+                // UpdateBalance가 아닌 명령은 그대로 유지
+                other_commands.push(cmd.clone());
+            }
+        }
+    }
+    
+    // 집계된 UpdateBalance를 다른 명령과 합치기
+    let mut processed_batch = Vec::new();
+    
+    // 다른 명령들을 먼저 추가 (InsertOrder, UpdateOrderStatus, InsertTrade)
+    processed_batch.extend(other_commands);
+    
+    // 집계된 UpdateBalance를 마지막에 추가
+    for ((user_id, mint), (total_available_delta, total_locked_delta)) in balance_updates {
+        // delta가 0이 아닌 경우만 추가
+        if total_available_delta != rust_decimal::Decimal::ZERO || total_locked_delta != rust_decimal::Decimal::ZERO {
+            processed_batch.push(DbCommand::UpdateBalance {
+                user_id,
+                mint,
+                available_delta: if total_available_delta != rust_decimal::Decimal::ZERO { 
+                    Some(total_available_delta) 
+                } else { 
+                    None 
+                },
+                locked_delta: if total_locked_delta != rust_decimal::Decimal::ZERO { 
+                    Some(total_locked_delta) 
+                } else { 
+                    None 
+                },
+            });
+        }
+    }
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 2. 배치 정렬 (외래키 제약조건을 위해)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // 1. InsertOrder (주문 먼저 생성)
     // 2. UpdateOrderStatus (주문 상태 업데이트)
     // 3. InsertTrade (체결 내역 - 주문이 있어야 함)
     // 4. UpdateBalance (잔고 업데이트)
-    batch.sort_by(|a, b| {
+    processed_batch.sort_by(|a, b| {
         let priority = |cmd: &DbCommand| match cmd {
             DbCommand::InsertOrder { .. } => 1,
             DbCommand::UpdateOrderStatus { .. } => 2,
@@ -1863,10 +1944,117 @@ async fn flush_batch(
         priority(a).cmp(&priority(b))
     });
     
-    // 각 명령 처리
-    for cmd in batch.drain(..) {
-        match cmd {
-            DbCommand::InsertOrder {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 3. Deadlock 재시도 로직
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const MAX_RETRIES: u32 = 3;
+    let mut retry_count = 0;
+    
+    loop {
+        // 트랜잭션 시작
+        let mut tx = match db_pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                if retry_count < MAX_RETRIES {
+                    retry_count += 1;
+                    let delay_ms = 100u64 * retry_count as u64; // 100ms, 200ms, 300ms
+                    eprintln!("[DB Writer] Failed to begin transaction (attempt {}), retrying in {}ms...", retry_count, delay_ms);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                return Err(anyhow::anyhow!("Failed to begin transaction after {} retries: {}", MAX_RETRIES, e));
+            }
+        };
+        
+        // 성공한 명령 인덱스 추적 (에러 발생 시 재시도 가능하도록)
+        let mut successful_indices = Vec::new();
+        let mut has_deadlock = false;
+        
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 4. 각 명령 처리 (drain 대신 인덱스 순회)
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // drain(..)을 사용하면 에러 발생 시 배치가 비워져서 재시도 불가능합니다.
+        // 인덱스 순회를 사용하여 성공한 명령만 나중에 제거합니다.
+        for (idx, cmd) in processed_batch.iter().enumerate() {
+            match process_db_command(cmd, &mut tx, db_pool).await {
+                Ok(_) => {
+                    // 성공한 명령 인덱스 저장
+                    successful_indices.push(idx);
+                }
+                Err(e) => {
+                    // Deadlock 에러 확인
+                    if is_deadlock_error(&e) {
+                        eprintln!("[DB Writer] Deadlock detected (attempt {}), will retry...", retry_count + 1);
+                        has_deadlock = true;
+                        break; // 트랜잭션 롤백 후 재시도
+                    } else {
+                        // Deadlock이 아닌 다른 에러는 즉시 반환
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        
+        // Deadlock 발생 시 재시도
+        if has_deadlock {
+            // 트랜잭션 롤백 (명시적으로 롤백하지 않아도 drop 시 자동 롤백)
+            drop(tx);
+            
+            if retry_count < MAX_RETRIES {
+                retry_count += 1;
+                let delay_ms = 100u64 * retry_count as u64; // 100ms, 200ms, 300ms
+                eprintln!("[DB Writer] Retrying after deadlock (attempt {}/{}) in {}ms...", retry_count, MAX_RETRIES, delay_ms);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                continue;
+            } else {
+                return Err(anyhow::anyhow!("Failed after {} retries due to deadlock", MAX_RETRIES));
+            }
+        }
+        
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // 5. 트랜잭션 커밋
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        match tx.commit().await {
+            Ok(_) => {
+                // 성공한 명령만 배치에서 제거 (역순으로 제거하여 인덱스 변경 방지)
+                successful_indices.sort_by(|a, b| b.cmp(a));
+                for &idx in &successful_indices {
+                    batch.remove(idx);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                // 커밋 실패 시 Deadlock 확인
+                if is_deadlock_error(&anyhow::anyhow!("{}", e)) {
+                    if retry_count < MAX_RETRIES {
+                        retry_count += 1;
+                        let delay_ms = 100u64 * retry_count as u64;
+                        eprintln!("[DB Writer] Commit failed due to deadlock (attempt {}), retrying in {}ms...", retry_count, delay_ms);
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    } else {
+                        return Err(anyhow::anyhow!("Failed to commit transaction after {} retries due to deadlock: {}", MAX_RETRIES, e));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Failed to commit transaction: {}", e));
+                }
+            }
+        }
+    }
+}
+
+/// 개별 DB 명령 처리 (헬퍼 함수)
+/// 
+/// 각 명령을 처리하고 에러 발생 시 반환합니다.
+async fn process_db_command(
+    cmd: &super::db_commands::DbCommand,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    db_pool: &PgPool,
+) -> Result<()> {
+    use super::db_commands::DbCommand;
+    
+    match cmd {
+        DbCommand::InsertOrder {
                 order_id,
                 user_id,
                 order_type,
@@ -1882,14 +2070,14 @@ async fn flush_batch(
             } => {
                 // ID 생성기로 생성한 ID를 사용 (auto increment 사용 안 함)
                 // order_id가 0이면 에러 (ID 생성기가 제대로 작동하지 않음)
-                if order_id == 0 {
+                if *order_id == 0 {
                     return Err(anyhow::anyhow!(
                         "Order ID is 0. ID generator may not be initialized properly."
                     ));
                 }
                 
                 // 상태 및 체결 정보 (시장가 주문은 최종 상태로 전달됨)
-                let final_status = status.unwrap_or_else(|| "pending".to_string());
+                let final_status = status.as_ref().map(|s| s.clone()).unwrap_or_else(|| "pending".to_string());
                 let final_filled_amount = filled_amount.unwrap_or(rust_decimal::Decimal::ZERO);
                 let final_filled_quote_amount = filled_quote_amount.unwrap_or(rust_decimal::Decimal::ZERO);
                 
@@ -1905,14 +2093,14 @@ async fn flush_batch(
                         updated_at = $13
                     "#
                 )
-                .bind(order_id as i64)
-                .bind(user_id as i64)
-                .bind(&order_type)
-                .bind(&order_side)
-                .bind(&base_mint)
-                .bind(&quote_mint)
-                .bind(&price)
-                .bind(&amount)
+                .bind(*order_id as i64)
+                .bind(*user_id as i64)
+                .bind(order_type)
+                .bind(order_side)
+                .bind(base_mint)
+                .bind(quote_mint)
+                .bind(price)
+                .bind(amount)
                 .bind(final_filled_amount)
                 .bind(final_filled_quote_amount)
                 .bind(&final_status)
@@ -1921,6 +2109,8 @@ async fn flush_batch(
                 .execute(&mut *tx)
                 .await
                 .context("Failed to insert order")?;
+                
+                Ok(())
             }
             
             DbCommand::UpdateOrderStatus {
@@ -1938,10 +2128,10 @@ async fn flush_batch(
                         WHERE id = $4
                         "#
                     )
-                    .bind(&status)
-                    .bind(&filled_amount)
+                    .bind(status)
+                    .bind(filled_amount)
                     .bind(chrono::Utc::now())
-                    .bind(order_id as i64)
+                    .bind(*order_id as i64)
                     .execute(&mut *tx)
                     .await
                     .context("Failed to update order status")?;
@@ -1953,15 +2143,17 @@ async fn flush_batch(
                         WHERE id = $5
                         "#
                     )
-                    .bind(&status)
-                    .bind(&filled_amount)
-                    .bind(&filled_quote_amount)
+                    .bind(status)
+                    .bind(filled_amount)
+                    .bind(filled_quote_amount)
                     .bind(chrono::Utc::now())
-                    .bind(order_id as i64)
+                    .bind(*order_id as i64)
                     .execute(&mut *tx)
                     .await
                     .context("Failed to update order status")?;
                 }
+                
+                Ok(())
             }
             
             DbCommand::InsertTrade {
@@ -1977,16 +2169,17 @@ async fn flush_batch(
                 timestamp,
             } => {
                 // buy_order_id, sell_order_id가 0이면 스킵 (주문이 아직 DB에 INSERT되지 않음)
-                if buy_order_id == 0 || sell_order_id == 0 {
+                if *buy_order_id == 0 || *sell_order_id == 0 {
                     eprintln!(
                         "[DB Writer] Skipping trade insert: buy_order_id={}, sell_order_id={} (orders not yet inserted)",
                         buy_order_id, sell_order_id
                     );
-                    continue;
+                    // 스킵된 것으로 처리 (성공으로 간주)
+                    return Ok(());
                 }
                 
                 // ID 생성기로 생성한 trade_id 사용
-                // 외래키 제약조건 위반이나 트랜잭션 abort 에러는 조용히 무시 (스케줄러가 orders를 삭제한 경우)
+                // 외래키 제약조건 위반, 트랜잭션 abort, Deadlock 에러 처리
                 match sqlx::query(
                     r#"
                     INSERT INTO trades (
@@ -1997,36 +2190,48 @@ async fn flush_batch(
                     ON CONFLICT (id) DO NOTHING
                     "#
                 )
-                .bind(trade_id as i64)
-                .bind(buy_order_id as i64)
-                .bind(sell_order_id as i64)
-                .bind(buyer_id as i64)
-                .bind(seller_id as i64)
-                .bind(&price)
-                .bind(&amount)
-                .bind(&base_mint)
-                .bind(&quote_mint)
+                .bind(*trade_id as i64)
+                .bind(*buy_order_id as i64)
+                .bind(*sell_order_id as i64)
+                .bind(*buyer_id as i64)
+                .bind(*seller_id as i64)
+                .bind(price)
+                .bind(amount)
+                .bind(base_mint)
+                .bind(quote_mint)
                 .bind(timestamp)
                 .execute(&mut *tx)
                 .await
                 {
                     Ok(_) => {
                         // 성공적으로 삽입됨
+                        Ok(())
                     }
                     Err(sqlx::Error::Database(db_err)) => {
+                        // 에러 코드 확인
+                        let error_code = db_err.code().as_deref().map(|s| s.to_string());
+                        
+                        // Deadlock 에러 코드 40P01 체크
+                        if error_code.as_deref() == Some("40P01") {
+                            // Deadlock 발생 → 재시도 로직으로 전달
+                            return Err(anyhow::anyhow!("Deadlock detected: {}", db_err));
+                        }
+                        
                         // 외래키 제약조건 위반 (23503) 또는 트랜잭션 abort (25P02)는 무시
                         // 스케줄러가 orders를 삭제한 경우 발생할 수 있음
-                        let error_code = db_err.code().as_deref().map(|s| s.to_string());
                         if error_code.as_deref() == Some("23503") || error_code.as_deref() == Some("25P02") {
-                            // 조용히 무시 (로그 출력 안 함)
+                            // 조용히 무시 (로그 출력 안 함, 성공으로 간주)
+                            Ok(())
                         } else {
                             // 다른 DB 에러는 로그만 출력하고 계속 진행
                             eprintln!("[DB Writer] Trade insert error (non-critical): trade_id={}, buy_order_id={}, sell_order_id={}, error={}", 
                                      trade_id, buy_order_id, sell_order_id, db_err);
+                            Ok(())
                         }
                     }
-                    Err(_e) => {
+                    Err(e) => {
                         // 다른 에러도 조용히 무시 (스케줄러 삭제로 인한 정상적인 상황)
+                        Ok(())
                     }
                 }
             }
@@ -2042,20 +2247,15 @@ async fn flush_batch(
                 
                 let balance_repo = UserBalanceRepository::new(db_pool.clone());
                 let update = UserBalanceUpdate {
-                    available_delta,
-                    locked_delta,
+                    available_delta: *available_delta,
+                    locked_delta: *locked_delta,
                 };
                 
-                balance_repo.update_balance(user_id, &mint, &update).await
+                balance_repo.update_balance(*user_id, mint, &update).await
                     .context("Failed to update balance")?;
+                
+                Ok(())
             }
-        }
     }
-    
-    // 트랜잭션 커밋
-    tx.commit().await
-        .context("Failed to commit transaction")?;
-            
-            Ok(())
 }
 

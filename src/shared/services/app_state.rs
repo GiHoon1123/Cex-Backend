@@ -77,6 +77,7 @@ impl AppState {
     /// Configure bot cleanup scheduler
     /// 
     /// 봇 user_id를 설정하고 스케줄러를 시작합니다.
+    /// 기본값: 비활성화 (API를 통해 활성화 필요)
     pub fn setup_bot_cleanup_scheduler(
         &mut self,
         bot1_user_id: Option<u64>,
@@ -89,10 +90,10 @@ impl AppState {
             bot2_user_id,
         );
         
-        // 스케줄러 시작
+        // 스케줄러 시작 (백그라운드 태스크 시작, 하지만 비활성화 상태)
         self.bot_cleanup_scheduler.start();
         
-        // 기본값: 활성화
-        self.bot_cleanup_scheduler.enable();
+        // 기본값: 비활성화 (API를 통해 활성화 필요)
+        // self.bot_cleanup_scheduler.enable(); // 제거: 기본값을 비활성화로 변경
     }
 }

@@ -122,12 +122,12 @@ jobs:
             
             # Docker 컨테이너 실행 (docker-compose.yml 없이 직접 실행)
             # cex-network를 사용하여 컨테이너 이름으로 DNS 조회 가능
+            # 주의: --cpuset-cpus 제거 → 코드 레벨 코어 고정 사용 (엔진 스레드만 Core 0 고정)
             docker run -d \
               --name cex-backend \
               --restart unless-stopped \
               --network cex-network \
               -p 3002:3002 \
-              --cpuset-cpus="0" \
               --cap-add=SYS_NICE \
               --cpus="1" \
               --memory="1.5g" \

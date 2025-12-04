@@ -10,9 +10,9 @@
 //   - UDP Feed: Core 3
 //
 // prod (인스턴스, 2코어):
-//   - Engine: Core 0
-//   - WAL: Core 1
-//   - 나머지: None (OS가 알아서 배치)
+//   - Engine: Core 0 (코어 고정 + 우선순위 99)
+//   - WAL: 코어 고정 안 함 (OS가 알아서 배치)
+//   - DB Writer: 코어 고정 안 함 (OS가 알아서 배치)
 // =====================================================
 
 /// 코어 설정 구조체
@@ -27,7 +27,7 @@
 pub struct CoreConfig {
     /// 엔진 스레드 코어 (항상 Some)
     pub engine_core: usize,
-    /// WAL 스레드 코어 (항상 Some)
+    /// WAL 스레드 코어 (dev는 사용, prod는 threads.rs에서 환경 체크하여 스킵)
     pub wal_core: usize,
     /// DB Writer 스레드 코어 (dev만 Some)
     pub db_writer_core: Option<usize>,
@@ -65,11 +65,11 @@ impl CoreConfig {
                 }
             }
             "prod" => {
-                // 프로덕션 환경 (2코어) - 최소한만
+                // 프로덕션 환경 (2코어) - 엔진 스레드만 코어 고정
                 Self {
-                    engine_core: 0,
-                    wal_core: 1,
-                    db_writer_core: None,  // 코어 고정 안 함
+                    engine_core: 0,  // 엔진 스레드만 코어 고정 (Core 0) + 우선순위 99
+                    wal_core: 0,     // WAL 스레드는 코어 고정 안 함 (threads.rs에서 환경 체크하여 스킵)
+                    db_writer_core: None,  // DB Writer 스레드는 코어 고정 안 함
                 }
             }
             _ => {

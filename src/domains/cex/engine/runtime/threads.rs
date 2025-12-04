@@ -1616,11 +1616,18 @@ pub fn wal_thread_loop(
     wal_dir: std::path::PathBuf,
 ) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1. 코어 고정 (Core 1)
+    // 1. 코어 고정 (프로덕션에서는 코어 고정 안 함)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 프로덕션 환경에서는 엔진 스레드만 코어 고정
+    // WAL 스레드는 코어 고정하지 않음 (OS가 알아서 배치)
     
     let config = CoreConfig::from_env();
+    let env = std::env::var("RUST_ENV").unwrap_or_else(|_| "dev".to_string());
+    
+    // dev 환경에서만 코어 고정 (prod는 코어 고정 안 함)
+    if env == "dev" {
     CoreConfig::set_core(Some(config.wal_core));
+    }
     
     // WAL 스레드는 실시간 스케줄링 불필요 (I/O 바운드)
     
@@ -2053,8 +2060,8 @@ async fn process_db_command(
 ) -> Result<()> {
     use super::db_commands::DbCommand;
     
-    match cmd {
-        DbCommand::InsertOrder {
+        match cmd {
+            DbCommand::InsertOrder {
                 order_id,
                 user_id,
                 order_type,
@@ -2253,9 +2260,9 @@ async fn process_db_command(
                 
                 balance_repo.update_balance(*user_id, mint, &update).await
                     .context("Failed to update balance")?;
-                
-                Ok(())
-            }
+            
+            Ok(())
+        }
     }
 }
 

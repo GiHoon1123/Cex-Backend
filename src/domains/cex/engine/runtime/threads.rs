@@ -527,6 +527,7 @@ pub(crate) fn process_submit_order(
         let mut successful_matches = Vec::new();
         let mut total_quote_used = Decimal::ZERO;
         let mut total_amount_used = Decimal::ZERO;
+        let mut total_base_amount_filled = Decimal::ZERO; // 실제 체결된 base 자산 수량 (매수/매도 모두)
         
         {
             let mut executor_guard = executor.lock();
@@ -536,6 +537,7 @@ pub(crate) fn process_submit_order(
                     Ok(_) => {
                         // 성공한 매칭만 추적
                         successful_matches.push(match_result.clone());
+                        total_base_amount_filled += match_result.amount; // 실제 체결된 base 자산 수량
                         if order_after_match.order_type == "buy" {
                             total_quote_used += match_result.price * match_result.amount;
                         } else {
@@ -554,8 +556,11 @@ pub(crate) fn process_submit_order(
         }
         
         // 디버깅: 성공한 매칭 확인
-        eprintln!("[Market Order Debug] order_id={}, successful_matches={}, total_quote_used={}, total_amount_used={}", 
-                 order_after_match.id, successful_matches.len(), total_quote_used, total_amount_used);
+        // 매수 주문: total_quote_used (사용된 USDT), total_base_amount_filled (체결된 SOL)
+        // 매도 주문: total_amount_used (사용된 SOL), total_base_amount_filled (체결된 SOL)
+        eprintln!("[Market Order Debug] order_id={}, order_type={}, successful_matches={}, total_quote_used={}, total_amount_used={}, total_base_amount_filled={}", 
+                 order_after_match.id, order_after_match.order_type, successful_matches.len(), 
+                 total_quote_used, total_amount_used, total_base_amount_filled);
         
         // 성공한 매칭만 사용하여 주문 상태 업데이트
         let matches = successful_matches;

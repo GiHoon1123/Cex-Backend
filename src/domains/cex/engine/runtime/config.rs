@@ -11,8 +11,8 @@
 //
 // prod (인스턴스, 2코어):
 //   - Engine: Core 0 (코어 고정 + 우선순위 99)
-//   - WAL: 코어 고정 안 함 (OS가 알아서 배치)
-//   - DB Writer: 코어 고정 안 함 (OS가 알아서 배치)
+//   - WAL: Core 1 (코어 고정)
+//   - DB Writer: 코어 고정 안 함
 // =====================================================
 
 /// 코어 설정 구조체
@@ -27,7 +27,7 @@
 pub struct CoreConfig {
     /// 엔진 스레드 코어 (항상 Some)
     pub engine_core: usize,
-    /// WAL 스레드 코어 (dev는 사용, prod는 threads.rs에서 환경 체크하여 스킵)
+    /// WAL 스레드 코어 (항상 Some)
     pub wal_core: usize,
     /// DB Writer 스레드 코어 (dev만 Some)
     pub db_writer_core: Option<usize>,
@@ -65,11 +65,12 @@ impl CoreConfig {
                 }
             }
             "prod" => {
-                // 프로덕션 환경 (2코어) - 엔진 스레드만 코어 고정
+                // 프로덕션 환경 (2코어) - 엔진과 WAL 스레드 코어 고정
+                // Docker 컨테이너 레벨 코어 제한 없음, 애플리케이션 레벨에서 코어 고정
                 Self {
-                    engine_core: 0,  // 엔진 스레드만 코어 고정 (Core 0) + 우선순위 99
-                    wal_core: 0,     // WAL 스레드는 코어 고정 안 함 (threads.rs에서 환경 체크하여 스킵)
-                    db_writer_core: None,  // DB Writer 스레드는 코어 고정 안 함
+                    engine_core: 0,  // 엔진만 Core 0 고정 + 우선순위 99
+                    wal_core: 1,     // WAL 스레드 Core 1 고정
+                    db_writer_core: None,  // 코어 고정 안 함
                 }
             }
             _ => {

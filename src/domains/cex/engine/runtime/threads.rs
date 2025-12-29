@@ -527,7 +527,6 @@ pub(crate) fn process_submit_order(
         let mut successful_matches = Vec::new();
         let mut total_quote_used = Decimal::ZERO;
         let mut total_amount_used = Decimal::ZERO;
-        let mut total_base_amount_filled = Decimal::ZERO; // 실제 체결된 base 자산 수량 (매수/매도 모두)
         
         {
             let mut executor_guard = executor.lock();
@@ -537,7 +536,6 @@ pub(crate) fn process_submit_order(
                     Ok(_) => {
                         // 성공한 매칭만 추적
                         successful_matches.push(match_result.clone());
-                        total_base_amount_filled += match_result.amount; // 실제 체결된 base 자산 수량
                         if order_after_match.order_type == "buy" {
                             total_quote_used += match_result.price * match_result.amount;
                         } else {
@@ -556,11 +554,8 @@ pub(crate) fn process_submit_order(
         }
         
         // 디버깅: 성공한 매칭 확인
-        // 매수 주문: total_quote_used (사용된 USDT), total_base_amount_filled (체결된 SOL)
-        // 매도 주문: total_amount_used (사용된 SOL), total_base_amount_filled (체결된 SOL)
-        eprintln!("[Market Order Debug] order_id={}, order_type={}, successful_matches={}, total_quote_used={}, total_amount_used={}, total_base_amount_filled={}", 
-                 order_after_match.id, order_after_match.order_type, successful_matches.len(), 
-                 total_quote_used, total_amount_used, total_base_amount_filled);
+        eprintln!("[Market Order Debug] order_id={}, successful_matches={}, total_quote_used={}, total_amount_used={}", 
+                 order_after_match.id, successful_matches.len(), total_quote_used, total_amount_used);
         
         // 성공한 매칭만 사용하여 주문 상태 업데이트
         let matches = successful_matches;
@@ -1621,18 +1616,11 @@ pub fn wal_thread_loop(
     wal_dir: std::path::PathBuf,
 ) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1. 코어 고정 (프로덕션에서는 코어 고정 안 함)
+    // 1. 코어 고정 (Core 1)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 프로덕션 환경에서는 엔진 스레드만 코어 고정
-    // WAL 스레드는 코어 고정하지 않음 (OS가 알아서 배치)
     
     let config = CoreConfig::from_env();
-    let env = std::env::var("RUST_ENV").unwrap_or_else(|_| "dev".to_string());
-    
-    // dev 환경에서만 코어 고정 (prod는 코어 고정 안 함)
-    if env == "dev" {
     CoreConfig::set_core(Some(config.wal_core));
-    }
     
     // WAL 스레드는 실시간 스케줄링 불필요 (I/O 바운드)
     
@@ -2065,8 +2053,8 @@ async fn process_db_command(
 ) -> Result<()> {
     use super::db_commands::DbCommand;
     
-        match cmd {
-            DbCommand::InsertOrder {
+    match cmd {
+        DbCommand::InsertOrder {
                 order_id,
                 user_id,
                 order_type,
@@ -2265,9 +2253,9 @@ async fn process_db_command(
                 
                 balance_repo.update_balance(*user_id, mint, &update).await
                     .context("Failed to update balance")?;
-            
-            Ok(())
-        }
+                
+                Ok(())
+            }
     }
 }
 

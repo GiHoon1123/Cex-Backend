@@ -101,22 +101,27 @@ pub fn engine_thread_loop(
     db: Option<Database>,
 ) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1. 코어 고정 (Core 0에 고정)
+    // 1. 코어 고정 (Core 0에 고정) - PROD 환경만
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     let config = CoreConfig::from_env();
     // 엔진 스레드를 Core 0에 고정 (주문 처리 전용)
+    // PROD: Core 0 고정, DEV: 코어 고정 안 함
     if config.engine_core != 999 {
+        eprintln!("[Engine Thread] Pinning to Core {}", config.engine_core);
         CoreConfig::set_core(Some(config.engine_core));
     } else {
+        eprintln!("[Engine Thread] Core pinning disabled (dev mode)");
         CoreConfig::set_core(None);  // 코어 고정 비활성화 (dev 환경)
     }
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 2. 실시간 스케줄링 설정 (우선순위 99)
+    // 2. 실시간 스케줄링 설정 (우선순위 99) - PROD 환경만
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // 실제 거래소에서 사용하는 방식: 최우선순위로 엔진 스레드 실행
     // Core 0을 독점하여 최대 성능 보장
+    // 주의: CAP_SYS_NICE 권한 필요 (Docker: --cap-add=SYS_NICE)
+    eprintln!("[Engine Thread] Setting real-time scheduling priority: 99");
     CoreConfig::set_realtime_scheduling(99);
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1622,18 +1627,21 @@ pub fn wal_thread_loop(
     wal_dir: std::path::PathBuf,
 ) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1. 코어 고정 (Core 1에 고정)
+    // 1. 코어 고정 설정 (PROD: 코어 고정 안 함, DEV: Core 1 고정)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     let config = CoreConfig::from_env();
-    // WAL 스레드를 Core 1에 고정 (디스크 I/O 전용)
+    // PROD 환경: 코어 고정 안 함 (OS 스케줄링에 맡김, 모든 리소스 활용)
+    // DEV 환경: Core 1에 고정 (디스크 I/O 전용)
     if config.wal_core != 999 {
+        eprintln!("[WAL Thread] Pinning to Core {}", config.wal_core);
         CoreConfig::set_core(Some(config.wal_core));
     } else {
-        CoreConfig::set_core(None);  // 코어 고정 비활성화 (dev 환경)
+        eprintln!("[WAL Thread] Core pinning disabled (OS scheduling)");
+        CoreConfig::set_core(None);  // 코어 고정 비활성화 (PROD 환경)
     }
     
-    // WAL 스레드는 실시간 스케줄링 불필요 (I/O 바운드)
+    // WAL 스레드는 실시간 스케줄링 불필요 (I/O 바운드, OS 스케줄링 충분)
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // 2. WalWriter 생성

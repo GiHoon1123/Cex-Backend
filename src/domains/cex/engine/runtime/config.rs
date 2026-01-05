@@ -54,8 +54,9 @@ impl CoreConfig {
     /// ```
     pub fn from_env() -> Self {
         let env = std::env::var("RUST_ENV").unwrap_or_else(|_| "dev".to_string());
+        eprintln!("[CoreConfig] Environment: {}", env);
         
-        match env.as_str() {
+        let config = match env.as_str() {
             "dev" => {
                 // 로컬 환경 (11코어) - 여러 코어 활용
                 Self {
@@ -65,13 +66,22 @@ impl CoreConfig {
                 }
             }
             "prod" => {
-                // 프로덕션 환경 (2코어) - 엔진 스레드만 Core 0에 고정
-                // 엔진 스레드: Core 0 고정 + 우선순위 99 (최우선 실행)
-                // WAL 스레드, DB Writer 스레드: 코어 고정 안 함 (OS 스케줄링)
+                // 프로덕션 환경 (2코어) - 하드웨어 자원 최대 활용
+                // 
+                // 설계 원칙:
+                // 1. 엔진 스레드: Core 0 고정 + 우선순위 99 (최우선 실행)
+                //    → 주문 처리 성능 최대화, 지연 시간 최소화
+                // 2. WAL 스레드: 코어 고정 안 함 (OS 스케줄링)
+                //    → I/O 바운드 작업, 유연한 스케줄링으로 다른 작업과 공유
+                // 3. DB Writer 스레드: 코어 고정 안 함 (OS 스케줄링)
+                //    → DB 작업, 유연한 스케줄링으로 다른 작업과 공유
+                // 4. Docker: CPU/메모리 제한 없음 → 서버의 모든 리소스 활용
+                //
+                // 결과: 엔진은 Core 0 독점, 나머지는 OS가 최적 스케줄링
                 Self {
-                    engine_core: 0,    // Core 0에 고정 (엔진 스레드 전용)
-                    wal_core: 999,     // 코어 고정 안 함 (특수 값)
-                    db_writer_core: None,  // 코어 고정 안 함 (유연한 스케줄링)
+                    engine_core: 0,    // Core 0에 고정 (엔진 스레드 전용, 우선순위 99)
+                    wal_core: 999,     // 코어 고정 안 함 (특수 값, OS 스케줄링)
+                    db_writer_core: None,  // 코어 고정 안 함 (OS 스케줄링)
                 }
             }
             _ => {
@@ -82,7 +92,17 @@ impl CoreConfig {
                     db_writer_core: None,
                 }
             }
-        }
+        };
+        
+        eprintln!("[CoreConfig] Engine core: {} ({}), WAL core: {} ({}), DB Writer core: {:?}",
+            config.engine_core,
+            if config.engine_core != 999 { "pinned" } else { "not pinned" },
+            config.wal_core,
+            if config.wal_core != 999 { "pinned" } else { "not pinned" },
+            config.db_writer_core
+        );
+        
+        config
     }
     
     /// 코어 고정 설정 (선택적)

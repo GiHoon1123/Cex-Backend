@@ -898,7 +898,8 @@ impl Engine for HighPerformanceEngine {
         self.balance_tx.as_ref().unwrap().send(cmd)
             .map_err(|e| anyhow::anyhow!("Failed to send update_balance command: {}", e))?;
         
-        timeout(Duration::from_millis(100), rx)
+        // DB 업데이트를 포함하므로 더 긴 타임아웃 필요 (운영서버 환경 고려)
+        timeout(Duration::from_secs(3), rx)
             .await
             .map_err(|_| anyhow::anyhow!("Update balance timeout"))?
             .map_err(|e| anyhow::anyhow!("Failed to receive response: {}", e))?

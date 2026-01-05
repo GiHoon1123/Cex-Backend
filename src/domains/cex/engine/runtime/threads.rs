@@ -101,16 +101,22 @@ pub fn engine_thread_loop(
     db: Option<Database>,
 ) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1. 코어 고정 (Core 0)
+    // 1. 코어 고정 (프로덕션에서는 비활성화)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     let config = CoreConfig::from_env();
-    CoreConfig::set_core(Some(config.engine_core));
+    // 프로덕션(2코어)에서는 코어 고정 비활성화 (OS/네트워크 스택과 충돌 방지)
+    if config.engine_core != 999 {
+        CoreConfig::set_core(Some(config.engine_core));
+    } else {
+        CoreConfig::set_core(None);  // 코어 고정 비활성화
+    }
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // 2. 실시간 스케줄링 설정 (우선순위 99)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    
+    // 실제 거래소에서 사용하는 방식: 최우선순위로 엔진 스레드 실행
+    // Core 0을 독점하여 최대 성능 보장
     CoreConfig::set_realtime_scheduling(99);
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1616,11 +1622,16 @@ pub fn wal_thread_loop(
     wal_dir: std::path::PathBuf,
 ) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1. 코어 고정 (Core 1)
+    // 1. 코어 고정 (프로덕션에서는 비활성화)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     let config = CoreConfig::from_env();
-    CoreConfig::set_core(Some(config.wal_core));
+    // 프로덕션(2코어)에서는 코어 고정 비활성화
+    if config.wal_core != 999 {
+        CoreConfig::set_core(Some(config.wal_core));
+    } else {
+        CoreConfig::set_core(None);  // 코어 고정 비활성화
+    }
     
     // WAL 스레드는 실시간 스케줄링 불필요 (I/O 바운드)
     

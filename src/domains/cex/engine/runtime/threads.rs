@@ -101,15 +101,15 @@ pub fn engine_thread_loop(
     db: Option<Database>,
 ) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1. 코어 고정 (프로덕션에서는 비활성화)
+    // 1. 코어 고정 (Core 0에 고정)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     let config = CoreConfig::from_env();
-    // 프로덕션(2코어)에서는 코어 고정 비활성화 (OS/네트워크 스택과 충돌 방지)
+    // 엔진 스레드를 Core 0에 고정 (주문 처리 전용)
     if config.engine_core != 999 {
         CoreConfig::set_core(Some(config.engine_core));
     } else {
-        CoreConfig::set_core(None);  // 코어 고정 비활성화
+        CoreConfig::set_core(None);  // 코어 고정 비활성화 (dev 환경)
     }
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1622,15 +1622,15 @@ pub fn wal_thread_loop(
     wal_dir: std::path::PathBuf,
 ) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 1. 코어 고정 (프로덕션에서는 비활성화)
+    // 1. 코어 고정 (Core 1에 고정)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     let config = CoreConfig::from_env();
-    // 프로덕션(2코어)에서는 코어 고정 비활성화
+    // WAL 스레드를 Core 1에 고정 (디스크 I/O 전용)
     if config.wal_core != 999 {
         CoreConfig::set_core(Some(config.wal_core));
     } else {
-        CoreConfig::set_core(None);  // 코어 고정 비활성화
+        CoreConfig::set_core(None);  // 코어 고정 비활성화 (dev 환경)
     }
     
     // WAL 스레드는 실시간 스케줄링 불필요 (I/O 바운드)

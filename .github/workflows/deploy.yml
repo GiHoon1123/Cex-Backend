@@ -137,16 +137,14 @@ jobs:
             
             # Docker 컨테이너 실행 (docker-compose.yml 없이 직접 실행)
             # cex-network를 사용하여 컨테이너 이름으로 DNS 조회 가능
-            # 주의: --cpuset-cpus 제거 → 애플리케이션 레벨에서 코어 고정 (엔진 스레드만 Core 0 고정)
+            # CPU/메모리 제한 없음 → 서버의 모든 리소스 사용
+            # 애플리케이션 레벨에서 엔진 스레드만 Core 0에 고정 (코드에서 처리)
             docker run -d \
               --name cex-backend \
               --restart unless-stopped \
               --network cex-network \
               -p 3002:3002 \
               --cap-add=SYS_NICE \
-              --cpus="1" \
-              --memory="1.5g" \
-              --memory-reservation="512m" \
               -e RUST_ENV=prod \
               -e RUST_LOG=info \
               -e DATABASE_HOST=cex-postgres \

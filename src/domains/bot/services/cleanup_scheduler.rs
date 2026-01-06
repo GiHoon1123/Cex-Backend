@@ -60,17 +60,30 @@ impl BotCleanupScheduler {
             let mut interval = interval(Duration::from_secs(180)); // 3분 = 180초
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             
+            eprintln!("[Bot Cleanup Scheduler] Background task started (interval: 180 seconds)");
+            
             loop {
                 interval.tick().await;
                 
                 // 활성화 상태 확인
                 if !enabled.load(Ordering::Relaxed) {
+                    eprintln!("[Bot Cleanup Scheduler] Skipping cleanup (scheduler is disabled)");
                     continue;
                 }
                 
+                eprintln!("[Bot Cleanup Scheduler] Starting cleanup...");
+                
                 // 봇 데이터 삭제 (두 봇의 주문 ID를 모두 수집하여 매수/매도가 모두 봇인 거래만 삭제)
-                if let Err(e) = Self::delete_bot_data_internal(&db, bot1_user_id, bot2_user_id).await {
-                    eprintln!("[Bot Cleanup Scheduler] Failed to delete bot data: {}", e);
+                match Self::delete_bot_data_internal(&db, bot1_user_id, bot2_user_id).await {
+                    Ok((deleted_orders, deleted_trades)) => {
+                        eprintln!(
+                            "[Bot Cleanup Scheduler] Cleanup completed: deleted {} orders, {} trades",
+                            deleted_orders, deleted_trades
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[Bot Cleanup Scheduler] Failed to delete bot data: {}", e);
+                    }
                 }
             }
         });
@@ -80,11 +93,14 @@ impl BotCleanupScheduler {
     /// Delete bot data (internal method)
     /// 
     /// 매수와 매도가 모두 봇인 거래만 삭제하여 일반 사용자의 거래 내역을 보존합니다.
+    /// 
+    /// # Returns
+    /// (deleted_orders_count, deleted_trades_count)
     async fn delete_bot_data_internal(
         db: &Database,
         _bot1_user_id: Option<u64>,
         _bot2_user_id: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<(u64, u64)> {
         // 1. 봇 이메일로 user_id 조회 (정확성 보장)
         let user_repo = UserRepository::new(db.pool().clone());
         
@@ -101,25 +117,32 @@ impl BotCleanupScheduler {
         }
         
         if bot_user_ids.is_empty() {
-            return Ok(());
+            eprintln!("[Bot Cleanup Scheduler] No bot users found, skipping cleanup");
+            return Ok((0, 0));
         }
         
+        eprintln!("[Bot Cleanup Scheduler] Found {} bot user(s), starting cleanup...", bot_user_ids.len());
+        
         // 2. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
-        sqlx::query(
+        let deleted_trades_result = sqlx::query(
             r#"
             DELETE FROM trades
             WHERE buyer_id = ANY($1) AND seller_id = ANY($1)
+            RETURNING id
             "#,
         )
         .bind(&bot_user_ids)
-        .execute(db.pool())
+        .fetch_all(db.pool())
         .await
         .context("Failed to delete bot-only trades")?;
         
+        let deleted_trades_count = deleted_trades_result.len() as u64;
+        eprintln!("[Bot Cleanup Scheduler] Deleted {} bot-only trades", deleted_trades_count);
+        
         // 3. 일반 사용자가 참여한 trade에 참여한 봇 order는 보존하고, 나머지만 삭제
         // 봇끼리만 거래한 trade에 참여한 order만 삭제
-            sqlx::query(
-                r#"
+        let deleted_orders_result = sqlx::query(
+            r#"
             DELETE FROM orders
             WHERE user_id = ANY($1)
             AND id NOT IN (
@@ -129,14 +152,18 @@ impl BotCleanupScheduler {
                 SELECT DISTINCT sell_order_id FROM trades
                 WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
             )
-                "#,
-            )
+            RETURNING id
+            "#,
+        )
         .bind(&bot_user_ids)
-            .execute(db.pool())
-            .await
-            .context("Failed to delete bot orders")?;
+        .fetch_all(db.pool())
+        .await
+        .context("Failed to delete bot orders")?;
         
-        Ok(())
+        let deleted_orders_count = deleted_orders_result.len() as u64;
+        eprintln!("[Bot Cleanup Scheduler] Deleted {} bot orders", deleted_orders_count);
+        
+        Ok((deleted_orders_count, deleted_trades_count))
     }
     
     /// 스케줄러 활성화

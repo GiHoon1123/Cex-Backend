@@ -93,8 +93,8 @@ impl AppState {
         // 스케줄러 시작 (백그라운드 태스크 시작)
         self.bot_cleanup_scheduler.start();
         
-        // 기본값: 활성화 (운영 서버에서 자동으로 동작하도록)
-        self.bot_cleanup_scheduler.enable();
-        eprintln!("[AppState] Bot cleanup scheduler enabled by default");
+        // 기본값: 비활성화 (매일 밤 11시 컨테이너 재시작으로 대체)
+        // self.bot_cleanup_scheduler.enable(); // 비활성화
+        eprintln!("[AppState] Bot cleanup scheduler disabled by default (using daily container restart instead)");
     }
 }

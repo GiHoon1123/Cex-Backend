@@ -41,24 +41,8 @@ pub async fn create_wallet(
         .map_err(|e: WalletError| -> (StatusCode, Json<serde_json::Value>) { e.into() })?;
 
     // 2. 모의거래소 초기 잔액 설정
-    // SOL: 10,000
-    // USDT: 10,000
+    // USDT: 10,000 (SOL은 지급하지 않음)
     let engine = app_state.engine.lock().await;
-    
-    // SOL 초기 잔액 설정
-    engine.update_balance(
-        user_id,
-        "SOL",
-        Decimal::new(10_000, 0),
-    ).await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Failed to set initial SOL balance: {}", e)
-            })),
-        )
-    })?;
     
     // USDT 초기 잔액 설정
     engine.update_balance(

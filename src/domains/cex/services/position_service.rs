@@ -158,9 +158,18 @@ impl PositionService {
             // 현재 평가액 = 현재 시장 가격 × 현재 보유 수량
             let value = market_price * current_balance;
             
-            // 미실현 손익 = 현재 평가액 - (평균 매수가 × 현재 보유 수량)
+            // 미실현 손익 계산
+            // 방법 1: total_bought_cost를 사용 (매수한 총 금액에서 매도한 부분의 원가를 빼야 함)
+            // 하지만 매도한 부분의 원가를 정확히 계산하기 어려우므로,
+            // 방법 2: 현재 보유량의 원가 = 평균 매수가 × 현재 보유 수량
+            // 단, 매도가 있었다면 total_bought_cost와 다를 수 있으므로 주의
             let avg_price = average_entry_price.unwrap();
-            let pnl = value - (avg_price * current_balance);
+            
+            // 현재 보유량의 원가 계산
+            // 매도가 없었다면: avg_price * current_balance = total_bought_cost
+            // 매도가 있었다면: avg_price * current_balance < total_bought_cost
+            let current_holdings_cost = avg_price * current_balance;
+            let pnl = value - current_holdings_cost;
             
             // 수익률 = (현재 가격 - 평균 매수가) / 평균 매수가 × 100
             // 이렇게 하면 초기 입금과 관계없이 정확한 수익률 계산 가능

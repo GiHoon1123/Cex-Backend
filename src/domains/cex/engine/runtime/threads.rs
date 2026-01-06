@@ -448,7 +448,9 @@ pub(crate) fn process_submit_order(
         }
     }
     
-    // 3. WAL 메시지 발행 (OrderCreated) - 잔고 잠금 후!
+    // 3. WAL 메시지 발행 (OrderCreated) - 잔고 잠금 후! - 주석 처리됨 (WAL 비활성화)
+    // WAL 로그 쓰기 비활성화 (디스크 공간 부족 문제로 인해 임시 비활성화)
+    /*
     if let Some(tx) = wal_tx {
         let wal_entry = WalEntry::OrderCreated {
             order_id: order.id,
@@ -462,6 +464,7 @@ pub(crate) fn process_submit_order(
         };
         let _ = tx.send(wal_entry);
     }
+    */
     
     // 3-1. 주문을 DB에 저장 (배치로 처리됨, trade insert 전에 필요 - 외래키 제약)
     // 주문 ID는 DB Writer가 INSERT 시 auto increment로 생성됨
@@ -1059,7 +1062,9 @@ fn handle_cancel_order(
         }
     };
     
-    // 3. WAL 메시지 발행 (OrderCancelled)
+    // 3. WAL 메시지 발행 (OrderCancelled) - 주석 처리됨 (WAL 비활성화)
+    // WAL 로그 쓰기 비활성화 (디스크 공간 부족 문제로 인해 임시 비활성화)
+    /*
     if let Some(tx) = wal_tx {
         let wal_entry = WalEntry::OrderCancelled {
             order_id,
@@ -1068,6 +1073,7 @@ fn handle_cancel_order(
         };
         let _ = tx.send(wal_entry);
     }
+    */
     
     // 4. 잔고 잠금 해제 (remaining_amount만큼)
     let order_type_str = order.order_type.as_str();
@@ -1260,7 +1266,9 @@ fn handle_unlock_balance(
 ) {
     let mut executor = executor.lock();
     
-    // WAL 메시지 발행
+    // WAL 메시지 발행 - 주석 처리됨 (WAL 비활성화)
+    // WAL 로그 쓰기 비활성화 (디스크 공간 부족 문제로 인해 임시 비활성화)
+    /*
     if let Some(tx) = wal_tx {
         let wal_entry = WalEntry::OrderCancelled {
             order_id: 0,  // TODO: 실제 order_id 전달
@@ -1269,6 +1277,7 @@ fn handle_unlock_balance(
         };
         let _ = tx.send(wal_entry);
     }
+    */
     
     // 잔고 잠금 해제
     match executor.unlock_balance_for_cancel(0, user_id, &mint, amount) {
@@ -1348,8 +1357,10 @@ fn handle_update_balance(
         (new_balance.available, new_balance.locked)
     };
     
-    // 2. WAL 메시지 발행 (BalanceUpdated)
+    // 2. WAL 메시지 발행 (BalanceUpdated) - 주석 처리됨 (WAL 비활성화)
     // 업데이트 후 잔고를 기록하여 복구 시 정확한 상태 복원 가능
+    // WAL 로그 쓰기 비활성화 (디스크 공간 부족 문제로 인해 임시 비활성화)
+    /*
     if let Some(tx) = wal_tx {
         let wal_entry = WalEntry::BalanceUpdated {
             user_id,
@@ -1360,6 +1371,7 @@ fn handle_update_balance(
         };
         let _ = tx.send(wal_entry);
     }
+    */
     
     // 3. DB 명령 전송 (UpdateBalance)
     // DB Writer 스레드가 배치로 처리 (100개 또는 10ms마다)

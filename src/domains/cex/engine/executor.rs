@@ -134,10 +134,12 @@ impl Executor {
     /// - Engine은 즉시 다음 작업 진행
     pub fn execute_trade(&mut self, match_result: &MatchResult, skip_db_updates: bool) -> Result<ExecutionResult> {
         // ============================================
-        // Step 1: WAL 메시지 발행 (가장 먼저!)
+        // Step 1: WAL 메시지 발행 (가장 먼저!) - 주석 처리됨 (WAL 비활성화)
         // ============================================
         // "야, WAL Thread! 이거 디스크에 써줘!" (메시지 발행)
         // Channel에 넣기만 하고 바로 리턴 (Non-blocking)
+        // WAL 로그 쓰기 비활성화 (디스크 공간 부족 문제로 인해 임시 비활성화)
+        /*
         if let Some(sender) = &self.wal_sender {
             let entry = WalEntry::TradeExecuted {
                 buy_order_id: match_result.buy_order_id,
@@ -155,6 +157,7 @@ impl Executor {
             sender.send(entry)
                 .context("Failed to send trade to WAL channel")?;
         }
+        */
         
         // ============================================
         // Step 2: 잔고 이체 (매도자 → 매수자)
@@ -253,7 +256,9 @@ impl Executor {
             }
         }
         
-        // WAL에도 기록 (복구용)
+        // WAL에도 기록 (복구용) - 주석 처리됨 (WAL 비활성화)
+        // WAL 로그 쓰기 비활성화 (디스크 공간 부족 문제로 인해 임시 비활성화)
+        /*
         if let Some(sender) = &self.wal_sender {
             // 매수자 USDT 잔고
             if let Some(buyer_usdt) = self.balance_cache.get_balance(match_result.buyer_id, &match_result.quote_mint) {
@@ -299,6 +304,7 @@ impl Executor {
                 })?;
             }
         }
+        */
         
         // ============================================
         // Step 4: 실행 결과 반환
@@ -331,7 +337,9 @@ impl Executor {
         mint: &str,
         amount: Decimal,
     ) -> Result<()> {
-        // WAL 메시지 발행 (먼저!)
+        // WAL 메시지 발행 (먼저!) - 주석 처리됨 (WAL 비활성화)
+        // WAL 로그 쓰기 비활성화 (디스크 공간 부족 문제로 인해 임시 비활성화)
+        /*
         if let Some(sender) = &self.wal_sender {
             sender.send(WalEntry::BalanceLocked {
                 user_id,
@@ -340,6 +348,7 @@ impl Executor {
                 timestamp: Utc::now().timestamp_millis(),
             })?;
         }
+        */
         
         // 잔고 잠금
         self.balance_cache.lock_balance(user_id, mint, amount)
@@ -366,7 +375,9 @@ impl Executor {
         mint: &str,
         amount: Decimal,
     ) -> Result<()> {
-        // WAL 메시지 발행
+        // WAL 메시지 발행 - 주석 처리됨 (WAL 비활성화)
+        // WAL 로그 쓰기 비활성화 (디스크 공간 부족 문제로 인해 임시 비활성화)
+        /*
         if let Some(sender) = &self.wal_sender {
             sender.send(WalEntry::OrderCancelled {
                 order_id,
@@ -374,6 +385,7 @@ impl Executor {
                 timestamp: Utc::now().timestamp_millis(),
             })?;
         }
+        */
         
         // 잔고 잠금 해제
         self.balance_cache.unlock_balance(user_id, mint, amount)

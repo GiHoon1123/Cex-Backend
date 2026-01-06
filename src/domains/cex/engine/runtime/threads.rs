@@ -1734,10 +1734,10 @@ pub fn db_writer_thread_loop(
     
     let mut batch = Vec::new();
     let batch_size_limit = 100;
-    // 운영 환경에서는 flush 시간을 늘려서 Deadlock 확률 감소
-    // 운영: 1000ms, 로컬: 10ms
+    // 운영 환경에서는 flush 시간을 조정하여 저장 지연과 Deadlock 확률의 균형 유지
+    // 운영: 500ms (체결내역 저장 지연 감소), 로컬: 10ms
     let batch_time_limit = if std::env::var("RUST_ENV").unwrap_or_else(|_| "dev".to_string()) == "prod" {
-        Duration::from_millis(1000)  // 운영: 1000ms
+        Duration::from_millis(500)  // 운영: 500ms (1000ms → 500ms로 단축하여 저장 지연 감소)
     } else {
         Duration::from_millis(10)   // 로컬: 10ms
     };
@@ -1964,9 +1964,10 @@ async fn flush_batch(
     });
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 3. Deadlock 재시도 로직
+    // 3. Deadlock 재시도 로직 (강화: 3회 → 5회)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    const MAX_RETRIES: u32 = 3;
+    // 배치 시간 단축(500ms)에 따른 데드락 확률 증가에 대비하여 재시도 강화
+    const MAX_RETRIES: u32 = 5;
     let mut retry_count = 0;
     
     loop {
@@ -1976,7 +1977,8 @@ async fn flush_batch(
             Err(e) => {
                 if retry_count < MAX_RETRIES {
                     retry_count += 1;
-                    let delay_ms = 100u64 * retry_count as u64; // 100ms, 200ms, 300ms
+                    // 지수 백오프: 100ms, 200ms, 400ms, 800ms, 1600ms
+                    let delay_ms = 100u64 * (1u64 << (retry_count - 1));
                     eprintln!("[DB Writer] Failed to begin transaction (attempt {}), retrying in {}ms...", retry_count, delay_ms);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     continue;
@@ -2021,7 +2023,8 @@ async fn flush_batch(
             
             if retry_count < MAX_RETRIES {
                 retry_count += 1;
-                let delay_ms = 100u64 * retry_count as u64; // 100ms, 200ms, 300ms
+                // 지수 백오프: 100ms, 200ms, 400ms, 800ms, 1600ms
+                let delay_ms = 100u64 * (1u64 << (retry_count - 1));
                 eprintln!("[DB Writer] Retrying after deadlock (attempt {}/{}) in {}ms...", retry_count, MAX_RETRIES, delay_ms);
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 continue;
@@ -2047,7 +2050,8 @@ async fn flush_batch(
                 if is_deadlock_error(&anyhow::anyhow!("{}", e)) {
                     if retry_count < MAX_RETRIES {
                         retry_count += 1;
-                        let delay_ms = 100u64 * retry_count as u64;
+                        // 지수 백오프: 100ms, 200ms, 400ms, 800ms, 1600ms
+                        let delay_ms = 100u64 * (1u64 << (retry_count - 1));
                         eprintln!("[DB Writer] Commit failed due to deadlock (attempt {}), retrying in {}ms...", retry_count, delay_ms);
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         continue;

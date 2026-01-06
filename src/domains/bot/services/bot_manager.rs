@@ -230,7 +230,23 @@ impl BotManager {
             return Ok(());
         }
         
-        // 2. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
+        // 2. 일반 사용자가 참여한 trade에 참여한 봇 order ID 수집 (보존 대상)
+        // 일반 사용자가 참여한 trade = buyer_id나 seller_id 중 하나라도 봇이 아닌 trade
+        let preserved_order_ids: Vec<i64> = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT DISTINCT buy_order_id FROM trades
+            WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
+            UNION
+            SELECT DISTINCT sell_order_id FROM trades
+            WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
+            "#,
+        )
+        .bind(&bot_user_ids)
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to get preserved order IDs")?;
+        
+        // 3. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
         sqlx::query(
             r#"
             DELETE FROM trades
@@ -242,25 +258,34 @@ impl BotManager {
         .await
         .context("Failed to delete bot-only trades")?;
         
-        // 3. 일반 사용자가 참여한 trade에 참여한 봇 order는 보존하고, 나머지만 삭제
-        // 일반 사용자가 참여한 trade = buyer_id나 seller_id 중 하나라도 봇이 아닌 trade
-        sqlx::query(
+        // 4. 봇의 모든 orders 삭제 (일반 사용자와 거래한 orders는 보존)
+        if preserved_order_ids.is_empty() {
+            // 보존할 orders가 없으면 봇의 모든 orders 삭제
+            sqlx::query(
                 r#"
-            DELETE FROM orders
-            WHERE user_id = ANY($1)
-            AND id NOT IN (
-                SELECT DISTINCT buy_order_id FROM trades
-                WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
-                UNION
-                SELECT DISTINCT sell_order_id FROM trades
-                WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
-            )
+                DELETE FROM orders
+                WHERE user_id = ANY($1)
                 "#,
             )
-        .bind(&bot_user_ids)
+            .bind(&bot_user_ids)
             .execute(self.db.pool())
             .await
             .context("Failed to delete bot orders")?;
+        } else {
+            // 보존할 orders가 있으면 제외하고 삭제
+            sqlx::query(
+                r#"
+                DELETE FROM orders
+                WHERE user_id = ANY($1)
+                AND id != ALL($2)
+                "#,
+            )
+            .bind(&bot_user_ids)
+            .bind(&preserved_order_ids)
+            .execute(self.db.pool())
+            .await
+            .context("Failed to delete bot orders")?;
+        }
         
         Ok(())
     }

@@ -199,18 +199,16 @@ impl BotManager {
         Ok(())
     }
     
-    /// 봇 계정의 모든 데이터 삭제 (주문 및 거래) - 두 봇을 함께 처리
-    /// Delete all bot data (orders and trades) - process both bots together
+    /// orders와 trades 테이블 전체 삭제
+    /// Delete all data from orders and trades tables
     /// 
-    /// 서버 재시작 시 이전에 생성된 봇 주문과 거래를 완전히 삭제합니다.
+    /// 서버 재시작 시 orders와 trades 테이블의 모든 데이터를 삭제합니다.
     /// 엔진 시작 전에 실행되므로 DB에서 직접 삭제합니다.
     /// 
     /// # 처리 순서
-    /// 1. 두 봇의 주문 ID를 모두 수집
-    /// 2. 매수와 매도가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
-    /// 3. 두 봇의 모든 주문 삭제
-    /// 
-    /// 매수와 매도가 모두 봇인 거래만 삭제하여 일반 사용자의 거래 내역을 보존합니다.
+    /// 1. 봇 user_id 조회 (봇 계정 생성용)
+    /// 2. orders 테이블 전체 삭제
+    /// 3. trades 테이블 전체 삭제
     pub(crate) async fn delete_all_bot_data_together(&self) -> Result<()> {
         eprintln!("[Bot Manager] Starting delete_all_bot_data_together()...");
         
@@ -245,46 +243,35 @@ impl BotManager {
         
         eprintln!("[Bot Manager] Bot user IDs to delete: {:?}", bot_user_ids);
         
-        // 2. 봇의 모든 orders 삭제 (trade에 연결된 orders는 보존)
-        // trades 삭제 전에 orders를 먼저 삭제해야 함
-        // trade에 연결되지 않은 orders만 삭제 (일반 사용자와 거래한 orders는 자동으로 보존됨)
-        // NOT EXISTS 사용 (성능 최적화, 서버 시작 전 실행이므로 락 경합 없음)
-        eprintln!("[Bot Manager] Starting orders deletion query (NOT EXISTS)...");
+        // 2. orders 테이블 전체 삭제
+        eprintln!("[Bot Manager] Starting orders deletion query (all data)...");
         let deleted_orders_result = sqlx::query(
             r#"
-            DELETE FROM orders o
-            WHERE o.user_id = ANY($1)
-            AND NOT EXISTS (
-                SELECT 1 FROM trades t
-                WHERE (t.buy_order_id = o.id OR t.sell_order_id = o.id)
-            )
-            RETURNING o.id
-            "#,
-        )
-        .bind(&bot_user_ids)
-        .fetch_all(self.db.pool())
-        .await
-        .context("Failed to delete bot orders")?;
-        
-        let deleted_orders_count = deleted_orders_result.len();
-        eprintln!("[Bot Manager] Deleted {} bot orders", deleted_orders_count);
-        
-        // 3. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
-        eprintln!("[Bot Manager] Starting trades deletion query...");
-        let deleted_trades_result = sqlx::query(
-            r#"
-            DELETE FROM trades
-            WHERE buyer_id = ANY($1) AND seller_id = ANY($1)
+            DELETE FROM orders
             RETURNING id
             "#,
         )
-        .bind(&bot_user_ids)
         .fetch_all(self.db.pool())
         .await
-        .context("Failed to delete bot-only trades")?;
+        .context("Failed to delete all orders")?;
+        
+        let deleted_orders_count = deleted_orders_result.len();
+        eprintln!("[Bot Manager] Deleted {} orders (all data)", deleted_orders_count);
+        
+        // 3. trades 테이블 전체 삭제
+        eprintln!("[Bot Manager] Starting trades deletion query (all data)...");
+        let deleted_trades_result = sqlx::query(
+            r#"
+            DELETE FROM trades
+            RETURNING id
+            "#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete all trades")?;
         
         let deleted_trades_count = deleted_trades_result.len();
-        eprintln!("[Bot Manager] Deleted {} bot-only trades", deleted_trades_count);
+        eprintln!("[Bot Manager] Deleted {} trades (all data)", deleted_trades_count);
         
         // 4. VACUUM ANALYZE 실행하여 dead tuple 정리 및 인덱스 최적화
         // 데이터 삭제 후 인덱스의 dead tuple이 남아있어 공간이 회수되지 않으므로 VACUUM 필요

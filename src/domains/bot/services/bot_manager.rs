@@ -248,45 +248,26 @@ impl BotManager {
         // 2. 봇의 모든 orders 삭제 (trade에 연결된 orders는 보존)
         // trades 삭제 전에 orders를 먼저 삭제해야 함
         // trade에 연결되지 않은 orders만 삭제 (일반 사용자와 거래한 orders는 자동으로 보존됨)
-        // 배치 삭제로 변경 (한 번에 10000개씩 삭제하여 락 경합 방지)
-        eprintln!("[Bot Manager] Starting batch orders deletion (10000 per batch)...");
-        let mut total_deleted = 0;
-        let batch_size = 10000;
-        
-        loop {
-            let deleted_batch = sqlx::query(
-                r#"
-                WITH deletable_orders AS (
-                    SELECT o.id
-                    FROM orders o
-                    WHERE o.user_id = ANY($1)
-                    AND NOT EXISTS (
-                        SELECT 1 FROM trades t
-                        WHERE (t.buy_order_id = o.id OR t.sell_order_id = o.id)
-                    )
-                    LIMIT $2
-                )
-                DELETE FROM orders
-                WHERE id IN (SELECT id FROM deletable_orders)
-                RETURNING id
-                "#,
+        // NOT EXISTS 사용 (성능 최적화, 서버 시작 전 실행이므로 락 경합 없음)
+        eprintln!("[Bot Manager] Starting orders deletion query (NOT EXISTS)...");
+        let deleted_orders_result = sqlx::query(
+            r#"
+            DELETE FROM orders o
+            WHERE o.user_id = ANY($1)
+            AND NOT EXISTS (
+                SELECT 1 FROM trades t
+                WHERE (t.buy_order_id = o.id OR t.sell_order_id = o.id)
             )
-            .bind(&bot_user_ids)
-            .bind(batch_size as i64)
-            .fetch_all(self.db.pool())
-            .await
-            .context("Failed to delete bot orders")?;
-            
-            let batch_count = deleted_batch.len();
-            total_deleted += batch_count;
-            eprintln!("[Bot Manager] Deleted batch: {} orders (total: {})", batch_count, total_deleted);
-            
-            if batch_count == 0 {
-                break;
-            }
-        }
+            RETURNING o.id
+            "#,
+        )
+        .bind(&bot_user_ids)
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete bot orders")?;
         
-        eprintln!("[Bot Manager] Deleted total {} bot orders", total_deleted);
+        let deleted_orders_count = deleted_orders_result.len();
+        eprintln!("[Bot Manager] Deleted {} bot orders", deleted_orders_count);
         
         // 3. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
         eprintln!("[Bot Manager] Starting trades deletion query...");

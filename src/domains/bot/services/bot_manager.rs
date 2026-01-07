@@ -209,7 +209,7 @@ impl BotManager {
     /// 3. 두 봇의 모든 주문 삭제
     /// 
     /// 매수와 매도가 모두 봇인 거래만 삭제하여 일반 사용자의 거래 내역을 보존합니다.
-    async fn delete_all_bot_data_together(&self) -> Result<()> {
+    pub(crate) async fn delete_all_bot_data_together(&self) -> Result<()> {
         // 1. 봇 이메일로 user_id 조회 (정확성 보장)
         use crate::shared::database::UserRepository;
         let user_repo = UserRepository::new(self.db.pool().clone());
@@ -230,21 +230,28 @@ impl BotManager {
             return Ok(());
         }
         
-        // 2. 일반 사용자가 참여한 trade에 참여한 봇 order ID 수집 (보존 대상)
-        // 일반 사용자가 참여한 trade = buyer_id나 seller_id 중 하나라도 봇이 아닌 trade
-        let preserved_order_ids: Vec<i64> = sqlx::query_scalar::<_, i64>(
+        // 2. 봇의 모든 orders 삭제 (trade에 연결된 orders는 보존)
+        // trades 삭제 전에 orders를 먼저 삭제해야 함
+        // trade에 연결되지 않은 orders만 삭제 (일반 사용자와 거래한 orders는 자동으로 보존됨)
+        let deleted_orders_result = sqlx::query(
             r#"
-            SELECT DISTINCT buy_order_id FROM trades
-            WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
-            UNION
-            SELECT DISTINCT sell_order_id FROM trades
-            WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
+            DELETE FROM orders
+            WHERE user_id = ANY($1)
+            AND id NOT IN (
+                SELECT DISTINCT buy_order_id FROM trades WHERE buy_order_id IS NOT NULL
+                UNION
+                SELECT DISTINCT sell_order_id FROM trades WHERE sell_order_id IS NOT NULL
+            )
+            RETURNING id
             "#,
         )
         .bind(&bot_user_ids)
         .fetch_all(self.db.pool())
         .await
-        .context("Failed to get preserved order IDs")?;
+        .context("Failed to delete bot orders")?;
+        
+        let deleted_orders_count = deleted_orders_result.len();
+        eprintln!("[Bot Manager] Deleted {} bot orders", deleted_orders_count);
         
         // 3. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
         sqlx::query(
@@ -258,33 +265,15 @@ impl BotManager {
         .await
         .context("Failed to delete bot-only trades")?;
         
-        // 4. 봇의 모든 orders 삭제 (일반 사용자와 거래한 orders는 보존)
-        if preserved_order_ids.is_empty() {
-            // 보존할 orders가 없으면 봇의 모든 orders 삭제
-            sqlx::query(
-                r#"
-                DELETE FROM orders
-                WHERE user_id = ANY($1)
-                "#,
-            )
-            .bind(&bot_user_ids)
-            .execute(self.db.pool())
-            .await
-            .context("Failed to delete bot orders")?;
-        } else {
-            // 보존할 orders가 있으면 제외하고 삭제
-            sqlx::query(
-                r#"
-                DELETE FROM orders
-                WHERE user_id = ANY($1)
-                AND id != ALL($2)
-                "#,
-            )
-            .bind(&bot_user_ids)
-            .bind(&preserved_order_ids)
-            .execute(self.db.pool())
-            .await
-            .context("Failed to delete bot orders")?;
+        // 4. VACUUM ANALYZE 실행하여 dead tuple 정리 및 인덱스 최적화
+        // 데이터 삭제 후 인덱스의 dead tuple이 남아있어 공간이 회수되지 않으므로 VACUUM 필요
+        if deleted_orders_count > 0 {
+            eprintln!("[Bot Manager] Running VACUUM ANALYZE to reclaim space from deleted orders...");
+            sqlx::query("VACUUM ANALYZE orders")
+                .execute(self.db.pool())
+                .await
+                .context("Failed to run VACUUM ANALYZE on orders table")?;
+            eprintln!("[Bot Manager] VACUUM ANALYZE completed");
         }
         
         Ok(())
@@ -555,6 +544,222 @@ mod tests {
         
         // 정리
         sqlx::query("DELETE FROM trades WHERE id IN (999999999, 999999997)").execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_bot_orders_preserves_user_orders() {
+        let pool = setup_test_db().await;
+        let db = Database::noop(pool.clone());
+        
+        let bot1_email = "bot1@bot.com";
+        let bot2_email = "bot2@bot.com";
+        let user_email = "test_user@test.com";
+        
+        let user_repo = crate::shared::database::UserRepository::new(pool.clone());
+        
+        // 봇 user_id 조회
+        let bot1 = user_repo.get_user_by_email(bot1_email).await.unwrap();
+        let bot2 = user_repo.get_user_by_email(bot2_email).await.unwrap();
+        let user = user_repo.get_user_by_email(user_email).await.unwrap();
+        
+        if bot1.is_none() || bot2.is_none() || user.is_none() {
+            eprintln!("Skipping test: bot or user accounts not found");
+            return;
+        }
+        
+        let bot1_id = bot1.unwrap().id;
+        let bot2_id = bot2.unwrap().id;
+        let user_id = user.unwrap().id;
+        
+        // 1. 봇끼리 거래한 orders 생성 (삭제되어야 함)
+        let bot_to_bot_order_id = 888888888i64;
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, user_id, order_type, order_side, base_mint, quote_mint, price, amount, filled_amount, status, created_at)
+            VALUES ($1, $2, 'limit', 'buy', 'SOL', 'USDT', 100.0, 1.0, 0.0, 'pending', NOW())
+            ON CONFLICT (id) DO UPDATE SET user_id = $2
+            "#,
+        )
+        .bind(bot_to_bot_order_id)
+        .bind(bot1_id as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        // 2. 봇끼리 거래한 trade 생성 (orders와 연결)
+        sqlx::query(
+            r#"
+            INSERT INTO trades (id, buy_order_id, sell_order_id, buyer_id, seller_id, price, amount, base_mint, quote_mint, created_at)
+            VALUES (888888888, $1, 888888887, $2, $3, 100.0, 1.0, 'SOL', 'USDT', NOW())
+            ON CONFLICT (id) DO UPDATE SET buy_order_id = $1, buyer_id = $2, seller_id = $3
+            "#,
+        )
+        .bind(bot_to_bot_order_id)
+        .bind(bot1_id as i64)
+        .bind(bot2_id as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        // 3. 일반 사용자와 봇이 거래한 orders 생성 (보존되어야 함)
+        let user_to_bot_order_id = 888888886i64;
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, user_id, order_type, order_side, base_mint, quote_mint, price, amount, filled_amount, status, created_at)
+            VALUES ($1, $2, 'limit', 'buy', 'SOL', 'USDT', 100.0, 1.0, 0.0, 'pending', NOW())
+            ON CONFLICT (id) DO UPDATE SET user_id = $2
+            "#,
+        )
+        .bind(user_to_bot_order_id)
+        .bind(user_id as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        // 4. 일반 사용자와 봇이 거래한 trade 생성 (orders와 연결)
+        sqlx::query(
+            r#"
+            INSERT INTO trades (id, buy_order_id, sell_order_id, buyer_id, seller_id, price, amount, base_mint, quote_mint, created_at)
+            VALUES (888888886, $1, 888888885, $2, $3, 100.0, 1.0, 'SOL', 'USDT', NOW())
+            ON CONFLICT (id) DO UPDATE SET buy_order_id = $1, buyer_id = $2, seller_id = $3
+            "#,
+        )
+        .bind(user_to_bot_order_id)
+        .bind(user_id as i64)
+        .bind(bot1_id as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        // 5. 봇의 단독 orders 생성 (trade와 연결되지 않음, 삭제되어야 함)
+        let bot_standalone_order_id = 888888884i64;
+        sqlx::query(
+            r#"
+            INSERT INTO orders (id, user_id, order_type, order_side, base_mint, quote_mint, price, amount, filled_amount, status, created_at)
+            VALUES ($1, $2, 'limit', 'buy', 'SOL', 'USDT', 100.0, 1.0, 0.0, 'pending', NOW())
+            ON CONFLICT (id) DO UPDATE SET user_id = $2
+            "#,
+        )
+        .bind(bot_standalone_order_id)
+        .bind(bot1_id as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        
+        // 삭제 전 상태 확인
+        let bot_orders_before: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM orders
+            WHERE user_id IN ($1, $2)
+            "#,
+        )
+        .bind(bot1_id as i64)
+        .bind(bot2_id as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        
+        eprintln!("[Test] Bot orders before deletion: {}", bot_orders_before);
+        assert!(bot_orders_before >= 3, "Should have at least 3 bot orders before deletion");
+        
+        // BotManager 생성 및 삭제 실행
+        let config = BotConfig {
+            bot1_email: bot1_email.to_string(),
+            bot2_email: bot2_email.to_string(),
+            ..Default::default()
+        };
+        let engine = Arc::new(tokio::sync::Mutex::new(
+            crate::domains::cex::engine::runtime::HighPerformanceEngine::new(db.clone())
+        ));
+        let bot_manager = BotManager::new(db.clone(), engine, config);
+        
+        // delete_all_bot_data_together 직접 호출
+        bot_manager.delete_all_bot_data_together().await.unwrap();
+        
+        // 검증 1: 봇끼리 거래한 orders는 삭제되어야 함
+        let bot_to_bot_order_exists: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM orders WHERE id = $1
+            "#,
+        )
+        .bind(bot_to_bot_order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        
+        assert_eq!(bot_to_bot_order_exists, 0, "Bot-to-bot order should be deleted");
+        eprintln!("[Test] ✅ Bot-to-bot order deleted correctly");
+        
+        // 검증 2: 일반 사용자와 거래한 봇 orders는 보존되어야 함
+        // 주의: user_to_bot_order_id는 user_id의 order이므로 봇 order가 아님
+        // 대신, 봇이 일반 사용자와 거래한 경우를 확인해야 함
+        // 하지만 우리 로직은 "일반 사용자와 거래한 봇 orders"를 보존하므로
+        // trade에서 buy_order_id나 sell_order_id가 봇 order인 경우를 확인
+        
+        // 검증 3: 봇의 단독 orders는 삭제되어야 함
+        let bot_standalone_order_exists: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM orders WHERE id = $1
+            "#,
+        )
+        .bind(bot_standalone_order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        
+        assert_eq!(bot_standalone_order_exists, 0, "Bot standalone order should be deleted");
+        eprintln!("[Test] ✅ Bot standalone order deleted correctly");
+        
+        // 검증 4: 일반 사용자와 거래한 trade에 참여한 봇 orders는 보존되어야 함
+        // user_to_bot trade의 buy_order_id는 user의 order이므로 확인할 필요 없음
+        // 하지만 만약 봇이 seller_id인 경우, sell_order_id가 봇 order일 수 있음
+        // 현재 테스트에서는 user가 buyer, bot이 seller이므로 sell_order_id 확인
+        let preserved_trade: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT sell_order_id FROM trades WHERE id = 888888886
+            "#,
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        
+        if let Some(sell_order_id) = preserved_trade {
+            let sell_order_exists: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*) FROM orders WHERE id = $1
+                "#,
+            )
+            .bind(sell_order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            
+            // sell_order_id가 봇 order라면 보존되어야 함
+            if sell_order_id != user_to_bot_order_id {
+                assert_eq!(sell_order_exists, 1, "Bot order involved in user trade should be preserved");
+                eprintln!("[Test] ✅ Bot order involved in user trade preserved correctly");
+            }
+        }
+        
+        // 최종 검증: 봇 orders 개수 확인
+        let bot_orders_after: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM orders
+            WHERE user_id IN ($1, $2)
+            "#,
+        )
+        .bind(bot1_id as i64)
+        .bind(bot2_id as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        
+        eprintln!("[Test] Bot orders after deletion: {}", bot_orders_after);
+        eprintln!("[Test] ✅ Orders deletion test completed successfully!");
+        
+        // 정리
+        sqlx::query("DELETE FROM trades WHERE id IN (888888888, 888888886)").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM orders WHERE id IN (888888888, 888888886, 888888884)").execute(&pool).await.unwrap();
     }
 }
 

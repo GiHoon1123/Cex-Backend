@@ -248,17 +248,17 @@ impl BotManager {
         // 2. 봇의 모든 orders 삭제 (trade에 연결된 orders는 보존)
         // trades 삭제 전에 orders를 먼저 삭제해야 함
         // trade에 연결되지 않은 orders만 삭제 (일반 사용자와 거래한 orders는 자동으로 보존됨)
-        eprintln!("[Bot Manager] Starting orders deletion query...");
+        // NOT IN 대신 NOT EXISTS 사용 (성능 최적화)
+        eprintln!("[Bot Manager] Starting orders deletion query (optimized with NOT EXISTS)...");
         let deleted_orders_result = sqlx::query(
             r#"
-            DELETE FROM orders
-            WHERE user_id = ANY($1)
-            AND id NOT IN (
-                SELECT DISTINCT buy_order_id FROM trades WHERE buy_order_id IS NOT NULL
-                UNION
-                SELECT DISTINCT sell_order_id FROM trades WHERE sell_order_id IS NOT NULL
+            DELETE FROM orders o
+            WHERE o.user_id = ANY($1)
+            AND NOT EXISTS (
+                SELECT 1 FROM trades t
+                WHERE (t.buy_order_id = o.id OR t.sell_order_id = o.id)
             )
-            RETURNING id
+            RETURNING o.id
             "#,
         )
         .bind(&bot_user_ids)

@@ -118,8 +118,10 @@ impl BotManager {
         // 2. 서버 재시작 시 이전 봇 데이터 모두 삭제
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         // 두 봇의 데이터를 한 번에 삭제 (일반 사용자 거래 보존)
+        eprintln!("[Bot Manager] Calling delete_all_bot_data_together()...");
         self.delete_all_bot_data_together().await
             .context("Failed to delete bot data")?;
+        eprintln!("[Bot Manager] prepare_bots() completed successfully");
         Ok(())
     }
     
@@ -210,6 +212,8 @@ impl BotManager {
     /// 
     /// 매수와 매도가 모두 봇인 거래만 삭제하여 일반 사용자의 거래 내역을 보존합니다.
     pub(crate) async fn delete_all_bot_data_together(&self) -> Result<()> {
+        eprintln!("[Bot Manager] Starting delete_all_bot_data_together()...");
+        
         // 1. 봇 이메일로 user_id 조회 (정확성 보장)
         use crate::shared::database::UserRepository;
         let user_repo = UserRepository::new(self.db.pool().clone());
@@ -217,22 +221,34 @@ impl BotManager {
         let mut bot_user_ids = Vec::new();
         
         // bot1@bot.com 조회
+        eprintln!("[Bot Manager] Looking up bot1: {}", self.config.bot1_email);
         if let Ok(Some(bot1)) = user_repo.get_user_by_email(&self.config.bot1_email).await {
             bot_user_ids.push(bot1.id as i64);
+            eprintln!("[Bot Manager] Found bot1: id={}", bot1.id);
+        } else {
+            eprintln!("[Bot Manager] Bot1 not found or error occurred");
         }
         
         // bot2@bot.com 조회
+        eprintln!("[Bot Manager] Looking up bot2: {}", self.config.bot2_email);
         if let Ok(Some(bot2)) = user_repo.get_user_by_email(&self.config.bot2_email).await {
             bot_user_ids.push(bot2.id as i64);
+            eprintln!("[Bot Manager] Found bot2: id={}", bot2.id);
+        } else {
+            eprintln!("[Bot Manager] Bot2 not found or error occurred");
         }
         
         if bot_user_ids.is_empty() {
+            eprintln!("[Bot Manager] No bot user IDs found, skipping deletion");
             return Ok(());
         }
+        
+        eprintln!("[Bot Manager] Bot user IDs to delete: {:?}", bot_user_ids);
         
         // 2. 봇의 모든 orders 삭제 (trade에 연결된 orders는 보존)
         // trades 삭제 전에 orders를 먼저 삭제해야 함
         // trade에 연결되지 않은 orders만 삭제 (일반 사용자와 거래한 orders는 자동으로 보존됨)
+        eprintln!("[Bot Manager] Starting orders deletion query...");
         let deleted_orders_result = sqlx::query(
             r#"
             DELETE FROM orders
@@ -254,16 +270,21 @@ impl BotManager {
         eprintln!("[Bot Manager] Deleted {} bot orders", deleted_orders_count);
         
         // 3. buyer_id와 seller_id가 모두 봇인 거래만 삭제 (일반 사용자 거래 보존)
-        sqlx::query(
+        eprintln!("[Bot Manager] Starting trades deletion query...");
+        let deleted_trades_result = sqlx::query(
             r#"
             DELETE FROM trades
             WHERE buyer_id = ANY($1) AND seller_id = ANY($1)
+            RETURNING id
             "#,
         )
         .bind(&bot_user_ids)
-        .execute(self.db.pool())
+        .fetch_all(self.db.pool())
         .await
         .context("Failed to delete bot-only trades")?;
+        
+        let deleted_trades_count = deleted_trades_result.len();
+        eprintln!("[Bot Manager] Deleted {} bot-only trades", deleted_trades_count);
         
         // 4. VACUUM ANALYZE 실행하여 dead tuple 정리 및 인덱스 최적화
         // 데이터 삭제 후 인덱스의 dead tuple이 남아있어 공간이 회수되지 않으므로 VACUUM 필요
@@ -276,6 +297,7 @@ impl BotManager {
             eprintln!("[Bot Manager] VACUUM ANALYZE completed");
         }
         
+        eprintln!("[Bot Manager] delete_all_bot_data_together() completed successfully");
         Ok(())
     }
 

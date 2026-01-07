@@ -256,22 +256,19 @@ impl BotManager {
         loop {
             let deleted_batch = sqlx::query(
                 r#"
-                DELETE FROM orders o
-                WHERE o.user_id = ANY($1)
-                AND NOT EXISTS (
-                    SELECT 1 FROM trades t
-                    WHERE (t.buy_order_id = o.id OR t.sell_order_id = o.id)
-                )
-                AND o.id IN (
-                    SELECT id FROM orders
-                    WHERE user_id = ANY($1)
+                WITH deletable_orders AS (
+                    SELECT o.id
+                    FROM orders o
+                    WHERE o.user_id = ANY($1)
                     AND NOT EXISTS (
                         SELECT 1 FROM trades t
-                        WHERE (t.buy_order_id = orders.id OR t.sell_order_id = orders.id)
+                        WHERE (t.buy_order_id = o.id OR t.sell_order_id = o.id)
                     )
                     LIMIT $2
                 )
-                RETURNING o.id
+                DELETE FROM orders
+                WHERE id IN (SELECT id FROM deletable_orders)
+                RETURNING id
                 "#,
             )
             .bind(&bot_user_ids)

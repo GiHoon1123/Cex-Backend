@@ -65,3 +65,4 @@ echo "- 엔진 스레드: Core 0에 고정, 우선순위 99 (SCHED_FIFO)"
 echo "- WAL 스레드: 코어 고정 안 함 (OS 스케줄링)"
 echo "- 로그에 'Pinning to Core 0', 'priority: 99' 메시지 확인"
 
+

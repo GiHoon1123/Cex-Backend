@@ -199,16 +199,17 @@ impl BotManager {
         Ok(())
     }
     
-    /// orders와 trades 테이블 전체 삭제
-    /// Delete all data from orders and trades tables
+    /// 모든 테이블 데이터 전체 삭제 (마이그레이션 테이블 제외)
+    /// Delete all data from all tables (except migration table)
     /// 
-    /// 서버 재시작 시 orders와 trades 테이블의 모든 데이터를 삭제합니다.
+    /// 서버 재시작 시 모든 테이블의 데이터를 삭제합니다.
+    /// _sqlx_migrations 테이블은 제외합니다.
     /// 엔진 시작 전에 실행되므로 DB에서 직접 삭제합니다.
     /// 
     /// # 처리 순서
     /// 1. 봇 user_id 조회 (봇 계정 생성용)
-    /// 2. orders 테이블 전체 삭제
-    /// 3. trades 테이블 전체 삭제
+    /// 2. 모든 테이블 데이터 삭제 (마이그레이션 테이블 제외)
+    /// 3. VACUUM ANALYZE 실행
     pub(crate) async fn delete_all_bot_data_together(&self) -> Result<()> {
         eprintln!("[Bot Manager] Starting delete_all_bot_data_together()...");
         
@@ -243,22 +244,11 @@ impl BotManager {
         
         eprintln!("[Bot Manager] Bot user IDs to delete: {:?}", bot_user_ids);
         
-        // 2. orders 테이블 전체 삭제
-        eprintln!("[Bot Manager] Starting orders deletion query (all data)...");
-        let deleted_orders_result = sqlx::query(
-            r#"
-            DELETE FROM orders
-            RETURNING id
-            "#,
-        )
-        .fetch_all(self.db.pool())
-        .await
-        .context("Failed to delete all orders")?;
+        // 2. 모든 테이블 데이터 삭제 (마이그레이션 테이블 제외)
+        // 외래키 관계를 고려하여 참조하는 테이블부터 삭제
+        // 순서: trades → orders → user_balances → transactions → solana_wallets → refresh_tokens → users → fee_configs
         
-        let deleted_orders_count = deleted_orders_result.len();
-        eprintln!("[Bot Manager] Deleted {} orders (all data)", deleted_orders_count);
-        
-        // 3. trades 테이블 전체 삭제
+        // 2-1. trades 테이블 전체 삭제 (orders를 참조하므로 먼저 삭제)
         eprintln!("[Bot Manager] Starting trades deletion query (all data)...");
         let deleted_trades_result = sqlx::query(
             r#"
@@ -269,18 +259,119 @@ impl BotManager {
         .fetch_all(self.db.pool())
         .await
         .context("Failed to delete all trades")?;
-        
         let deleted_trades_count = deleted_trades_result.len();
         eprintln!("[Bot Manager] Deleted {} trades (all data)", deleted_trades_count);
         
-        // 4. VACUUM ANALYZE 실행하여 dead tuple 정리 및 인덱스 최적화
+        // 2-2. orders 테이블 전체 삭제 (trades가 orders를 참조하므로 trades 삭제 후)
+        eprintln!("[Bot Manager] Starting orders deletion query (all data)...");
+        let deleted_orders_result = sqlx::query(
+            r#"
+            DELETE FROM orders
+            RETURNING id
+            "#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete all orders")?;
+        let deleted_orders_count = deleted_orders_result.len();
+        eprintln!("[Bot Manager] Deleted {} orders (all data)", deleted_orders_count);
+        
+        // 2-3. user_balances 테이블 전체 삭제 (users를 참조하므로 users 삭제 전)
+        eprintln!("[Bot Manager] Starting user_balances deletion query (all data)...");
+        let deleted_balances_result = sqlx::query(
+            r#"
+            DELETE FROM user_balances
+            RETURNING user_id
+            "#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete all user_balances")?;
+        let deleted_balances_count = deleted_balances_result.len();
+        eprintln!("[Bot Manager] Deleted {} user_balances (all data)", deleted_balances_count);
+        
+        // 2-4. transactions 테이블 전체 삭제 (users를 참조할 수 있으므로 users 삭제 전)
+        eprintln!("[Bot Manager] Starting transactions deletion query (all data)...");
+        let deleted_transactions_result = sqlx::query(
+            r#"
+            DELETE FROM transactions
+            RETURNING id
+            "#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete all transactions")?;
+        let deleted_transactions_count = deleted_transactions_result.len();
+        eprintln!("[Bot Manager] Deleted {} transactions (all data)", deleted_transactions_count);
+        
+        // 2-5. solana_wallets 테이블 전체 삭제 (외래키 없지만 논리적으로 users 참조)
+        eprintln!("[Bot Manager] Starting solana_wallets deletion query (all data)...");
+        let deleted_wallets_result = sqlx::query(
+            r#"
+            DELETE FROM solana_wallets
+            RETURNING id
+            "#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete all solana_wallets")?;
+        let deleted_wallets_count = deleted_wallets_result.len();
+        eprintln!("[Bot Manager] Deleted {} solana_wallets (all data)", deleted_wallets_count);
+        
+        // 2-6. refresh_tokens 테이블 전체 삭제 (users를 참조하므로 users 삭제 전)
+        eprintln!("[Bot Manager] Starting refresh_tokens deletion query (all data)...");
+        let deleted_tokens_result = sqlx::query(
+            r#"
+            DELETE FROM refresh_tokens
+            RETURNING id
+            "#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete all refresh_tokens")?;
+        let deleted_tokens_count = deleted_tokens_result.len();
+        eprintln!("[Bot Manager] Deleted {} refresh_tokens (all data)", deleted_tokens_count);
+        
+        // 2-7. users 테이블 전체 삭제 (다른 테이블들이 참조하므로 마지막에 삭제, 봇 계정은 재생성됨)
+        eprintln!("[Bot Manager] Starting users deletion query (all data)...");
+        let deleted_users_result = sqlx::query(
+            r#"
+            DELETE FROM users
+            RETURNING id
+            "#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete all users")?;
+        let deleted_users_count = deleted_users_result.len();
+        eprintln!("[Bot Manager] Deleted {} users (all data)", deleted_users_count);
+        
+        // 2-8. fee_configs 테이블 전체 삭제 (독립적인 테이블)
+        eprintln!("[Bot Manager] Starting fee_configs deletion query (all data)...");
+        let deleted_fee_configs_result = sqlx::query(
+            r#"
+            DELETE FROM fee_configs
+            RETURNING id
+            "#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .context("Failed to delete all fee_configs")?;
+        let deleted_fee_configs_count = deleted_fee_configs_result.len();
+        eprintln!("[Bot Manager] Deleted {} fee_configs (all data)", deleted_fee_configs_count);
+        
+        // 3. VACUUM ANALYZE 실행하여 dead tuple 정리 및 인덱스 최적화
         // 데이터 삭제 후 인덱스의 dead tuple이 남아있어 공간이 회수되지 않으므로 VACUUM 필요
-        if deleted_orders_count > 0 {
-            eprintln!("[Bot Manager] Running VACUUM ANALYZE to reclaim space from deleted orders...");
-            sqlx::query("VACUUM ANALYZE orders")
+        let total_deleted = deleted_orders_count + deleted_trades_count + deleted_balances_count 
+            + deleted_transactions_count + deleted_wallets_count + deleted_tokens_count 
+            + deleted_users_count + deleted_fee_configs_count;
+        
+        if total_deleted > 0 {
+            eprintln!("[Bot Manager] Running VACUUM ANALYZE to reclaim space from deleted data...");
+            sqlx::query("VACUUM ANALYZE")
                 .execute(self.db.pool())
                 .await
-                .context("Failed to run VACUUM ANALYZE on orders table")?;
+                .context("Failed to run VACUUM ANALYZE")?;
             eprintln!("[Bot Manager] VACUUM ANALYZE completed");
         }
         

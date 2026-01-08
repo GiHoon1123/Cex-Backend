@@ -82,7 +82,7 @@ impl BotCleanupScheduler {
                         );
                     }
                     Err(e) => {
-                        eprintln!("[Bot Cleanup Scheduler] Failed to delete bot data: {}", e);
+                    eprintln!("[Bot Cleanup Scheduler] Failed to delete bot data: {}", e);
                     }
                 }
             }
@@ -142,7 +142,7 @@ impl BotCleanupScheduler {
         // 3. 일반 사용자가 참여한 trade에 참여한 봇 order는 보존하고, 나머지만 삭제
         // 봇끼리만 거래한 trade에 참여한 order만 삭제
         let deleted_orders_result = sqlx::query(
-            r#"
+                r#"
             DELETE FROM orders
             WHERE user_id = ANY($1)
             AND id NOT IN (
@@ -153,12 +153,12 @@ impl BotCleanupScheduler {
                 WHERE buyer_id != ALL($1) OR seller_id != ALL($1)
             )
             RETURNING id
-            "#,
-        )
+                "#,
+            )
         .bind(&bot_user_ids)
         .fetch_all(db.pool())
-        .await
-        .context("Failed to delete bot orders")?;
+            .await
+            .context("Failed to delete bot orders")?;
         
         let deleted_orders_count = deleted_orders_result.len() as u64;
         eprintln!("[Bot Cleanup Scheduler] Deleted {} bot orders", deleted_orders_count);

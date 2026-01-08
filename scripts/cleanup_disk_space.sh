@@ -1,6 +1,7 @@
 #!/bin/bash
 # 디스크 공간 정리 스크립트
 # 주기적으로 실행하여 디스크 공간을 확보합니다.
+# 디스크 사용량이 90% 이상이면 강제로 데이터를 삭제합니다.
 
 LOG_FILE="/home/ec2-user/logs/disk_cleanup.log"
 LOG_DIR="/home/ec2-user/logs"
@@ -13,7 +14,88 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
+# 디스크 사용량 확인 함수
+get_disk_usage() {
+    df -h / | tail -1 | awk '{print $5}' | sed 's/%//'
+}
+
+# 강제 데이터 삭제 함수 (디스크가 90% 이상일 때)
+force_delete_data() {
+    log "⚠️ 디스크 사용량이 90% 이상입니다. 강제 데이터 삭제를 시작합니다..."
+    
+    # PostgreSQL에 직접 연결하여 모든 테이블 데이터 삭제
+    log "1. PostgreSQL 데이터베이스에 직접 연결하여 데이터 삭제 중..."
+    
+    # 컨테이너가 실행 중인지 확인
+    if ! docker ps | grep -q cex-postgres; then
+        log "❌ PostgreSQL 컨테이너가 실행 중이 아닙니다. 컨테이너를 시작합니다..."
+        docker start cex-postgres
+        sleep 5
+    fi
+    
+    # PostgreSQL 연결 대기
+    for i in {1..30}; do
+        if docker exec cex-postgres pg_isready -U root > /dev/null 2>&1; then
+            break
+        fi
+        log "PostgreSQL 연결 대기 중... ($i/30)"
+        sleep 1
+    done
+    
+    # 모든 테이블 데이터 삭제 (마이그레이션 테이블 제외)
+    log "2. 모든 테이블 데이터 삭제 중..."
+    docker exec cex-postgres psql -U root -d cex <<EOF 2>&1 | tee -a "$LOG_FILE"
+-- 외래키 제약조건을 일시적으로 비활성화 (삭제 순서 문제 해결)
+SET session_replication_role = 'replica';
+
+-- 모든 테이블 데이터 삭제 (마이그레이션 테이블 제외)
+DELETE FROM trades;
+DELETE FROM orders;
+DELETE FROM user_balances;
+DELETE FROM transactions;
+DELETE FROM solana_wallets;
+DELETE FROM refresh_tokens;
+DELETE FROM users;
+DELETE FROM fee_configs;
+
+-- 외래키 제약조건 다시 활성화
+SET session_replication_role = 'origin';
+
+-- VACUUM FULL 실행 (공간 회수)
+VACUUM FULL;
+EOF
+    
+    if [ $? -eq 0 ]; then
+        log "✅ 강제 데이터 삭제 완료"
+    else
+        log "❌ 강제 데이터 삭제 실패"
+    fi
+}
+
 log "=== 디스크 공간 정리 시작 ==="
+
+# 디스크 사용량 확인
+DISK_USAGE=$(get_disk_usage)
+log "현재 디스크 사용량: ${DISK_USAGE}%"
+
+# 디스크 사용량이 90% 이상이면 강제 데이터 삭제
+if [ "$DISK_USAGE" -ge 90 ]; then
+    log "⚠️ 경고: 디스크 사용량이 ${DISK_USAGE}%입니다 (90% 이상)"
+    force_delete_data
+    
+    # 삭제 후 다시 디스크 사용량 확인
+    DISK_USAGE=$(get_disk_usage)
+    log "데이터 삭제 후 디스크 사용량: ${DISK_USAGE}%"
+    
+    # 여전히 90% 이상이면 컨테이너 재시작 시도
+    if [ "$DISK_USAGE" -ge 90 ]; then
+        log "⚠️ 여전히 디스크 사용량이 높습니다. 컨테이너 재시작을 시도합니다..."
+        docker restart cex-backend 2>&1 | tee -a "$LOG_FILE"
+        sleep 10
+        DISK_USAGE=$(get_disk_usage)
+        log "컨테이너 재시작 후 디스크 사용량: ${DISK_USAGE}%"
+    fi
+fi
 
 # 1. Docker 사용하지 않는 이미지 삭제
 log "1. Docker 사용하지 않는 이미지 삭제 중..."

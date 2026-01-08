@@ -1,8 +1,37 @@
 #!/bin/bash
-# 디스크 공간 정리 크론 작업을 설정합니다.
-# 주기적으로 디스크 공간을 정리하여 여유 공간을 확보합니다.
-
-# 한국 시간 새벽 2시 = UTC 17시 (전날)
+# =====================================================
+# 디스크 공간 정리 크론 설정 스크립트
+# Disk Cleanup Cron Setup Script
+# =====================================================
+#
+# 용도:
+#   - 디스크 공간 정리 크론 작업을 설정합니다
+#   - cleanup_disk_space.sh를 크론에 등록합니다
+#   - 주기적으로 디스크 공간을 정리하여 여유 공간을 확보합니다
+#
+# 실행 시간:
+#   - 한국 시간: 매일 새벽 2시
+#   - UTC 시간: 매일 17시 (전날)
+#
+# 크론 작업:
+#   - /usr/local/bin/cleanup_disk_space.sh 실행
+#   - 로그: /home/ec2-user/logs/disk_cleanup.log
+#
+# 주요 기능 (cleanup_disk_space.sh):
+#   1. 디스크 사용량 확인 (90% 이상 시 강제 데이터 삭제)
+#   2. Docker 이미지 및 빌드 캐시 정리
+#   3. PostgreSQL VACUUM ANALYZE 실행
+#   4. PostgreSQL WAL 상태 확인
+#   5. 시스템 패키지 캐시 정리
+#
+# 실행 방법:
+#   - 한 번만 실행하면 크론에 등록됩니다
+#   - ./scripts/setup_disk_cleanup_cron.sh
+#
+# 주의:
+#   - cleanup_disk_space.sh가 /usr/local/bin/에 복사됩니다
+#   - 기존 디스크 정리 크론 작업은 제거되고 새로 추가됩니다
+# =====================================================
 CRON_JOB="0 17 * * * /usr/local/bin/cleanup_disk_space.sh >> /home/ec2-user/logs/disk_cleanup.log 2>&1"
 LOG_DIR="/home/ec2-user/logs"
 SCRIPT_PATH="/usr/local/bin/cleanup_disk_space.sh"
